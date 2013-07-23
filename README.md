@@ -40,3 +40,7 @@ Artur Neumann at [INF](http://www.inf.org/ "INF")
 ## Changelog ##
 ###2.1 -> 2.2 ###
 More robust when link goes down during sync
+###2.3 -> 2.3 ###
+* code cleanup
+* clearer messages & better error reporting
+* bugfixes

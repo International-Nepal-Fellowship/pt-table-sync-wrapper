@@ -2,7 +2,7 @@
 
 #Autor: Artur Neumann INF/N ict.projects@nepal.inf.org
 #Version: see $version variable
-#last change: 2013.06.25
+#last change: 2013.07.23
 #This script is written to syncronize the INF personnel database on different server
 #Its written arround pt-table-sync: http://www.percona.com/doc/percona-toolkit
 #and unison: http://www.cis.upenn.edu/~bcpierce/unison/
@@ -36,15 +36,18 @@ use MIME::Base64;
 
 #Variables to configure
 #------------------------------------------------------
-my $version = "2.2";
+my $version = "2.3";
 my $ptTableSync = "/usr/bin/pt-table-sync";    #install from http://www.percona.com/doc/percona-toolkit/2.1/installation.html
 my $syncCommandAdditionalAttributes = " --print --execute --conflict-comparison newest --verbose --conflict-error die --function MD5";
 my $emailFromAddress                = 'yourmail@company.org';
 my $unison                   = "/usr/bin/unison";               #to install on ubunto run 'sudo apt-get install unison'
 my $conflictEmailCCAddresses = 'yourmail@company.org';    #separate addresses by comma
 my $administratorAddresses   = 'yourmail@company.org';    #addresses the output of the script will be send
-my $preExecutionSQLcommand  = "UPDATE `site` SET `maintenance` = '0' WHERE `site_specific_id` =?;";
+my $preExecutionSQLcommand  = "UPDATE `site` SET `maintenance` = '1' WHERE `site_specific_id` =?;";
 my $postExecutionSQLcommand = "UPDATE `site` SET `maintenance` = '0' WHERE `site_specific_id` =?;";
+my $mysql_connect_timeout=5;
+my $mysql_read_timeout=1;
+
 
 #use this line send emails via sendmail
 #MIME::Lite->send('sendmail');
@@ -56,43 +59,41 @@ my $postExecutionSQLcommand = "UPDATE `site` SET `maintenance` = '0' WHERE `site
 MIME::Lite->send( 'smtp', "company.org", AuthUser => 'mail@company.org', AuthPass => 'xxxx' );
 
 #list of servers in the network
-my @servers = (
-        {
+my %servers = (
+        
+        1 => { #this number must be the same id as in the auto_increment_offset variable in the my.cnf config file
+               #AND the site_specific_id  in the site table
 
-           #this must be the server this script runs on, its the main one
-           host     => "localhost",
-           database => "dbname",
-           username => "db-sync-user",
-           password => "db-syncpasword",
-           type     => "master",                  #the first server must be a master, it writes data to other servers
-           id       => "1",                       #this number must be the same id as in the auto_increment_offset variable in the my.cnf config file
-                                                       #AND the site_specific_id  in the site table
-           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
+	           #this must be the server this script runs on, its the main one
+	           host     => "localhost",
+	           database => "dbname",
+         	   username => "db-sync-user",
+                   password => "db-syncpasword",
+	           type     => "master",                  #the first server must be a master, it writes data to other servers
+	           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
         },
-        {
-           host     => "hosta.ngo.org",
-           database => "dbname",
-           username => "db-sync-user",
-           password => "db-syncpasword",
-           type     => "master",                   #can be "master" OR "slave"
-                                                  #a master server will write his data to all other servers
-                                                  #so between master servers datachanges will be sync bidirectional
-                                                  #a slave server is not allowed to write data to other servers,
-                                                  #a slave server will just receive data and all changes on a slave
-                                                  #server will be overwritten at the next sync by data from the master server(s)
-           id       => "2",
-           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
+         2 => {
+	           host     => "192.168.56.102",
+	           database => "dbname",
+         	   username => "db-sync-user",
+                   password => "db-syncpasword",
+	           type     => "master",                  #can be "master" OR "slave"
+	                                                  #a master server will write his data to all other servers
+	                                                  #so between master servers datachanges will be sync bidirectional
+	                                                  #a slave server is not allowed to write data to other servers,
+	                                                  #a slave server will just receive data and all changes on a slave
+	                                                  #server will be overwritten at the next sync by data from the master server(s)
+	           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
 
         },
-        {
-           host     => "hostb.ngo.org",
-           database => "dbname",
-           username => "db-sync-user",
-           password => "db-syncpasword",
-           type     => "slave",                   #can be "master" OR "slave"
-           id       => "3",
-           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
-        },
+         3 => {
+	           host     => "192.168.56.103",
+	           database => "dbname",
+         	   username => "db-sync-user",
+                   password => "db-syncpasword",
+	           type     => "master",                   #can be "master" OR "slave"
+	           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
+        },       
 
 );
 
@@ -116,13 +117,15 @@ my @tableData = (
 	[ "name",                     "name_timestamp" ]
 
 );
+
 #do not change anything below this line or your computer will explode, the sun will fade, the universe colaps and the world we
 #know will end. So be carefull, You have been warned!
 #-------------------------------------------------------------------------------------
 
 my @conflicts;
+my @errors;
 my %servers_to_retry;
-my @dbh;
+my %dbh;
 my $insertCount     = 0;
 my $updateCount     = 0;
 my $syncSummary     = "Version: $version \nSync started at: " . strftime( '%d-%m-%Y %H:%M', localtime ) . "\n\n";
@@ -132,6 +135,12 @@ my $errorOutput     = "";
 my $unisonLogFile   = "";
 my $errorString;
 my $fields_hash;
+my $server_id;
+my $emailSubjectPostfix = "";
+
+#This are MySQL and percona table sync error that just lead to a warning and a retry, all other errors will cause a abbort
+my $warning_errors = ".*?((Lost connection to MySQL server)|(Can\'t connect to MySQL server)|(MySQL server has gone away)|(Issuing rollback)).*?";
+
 
 my $sql;
 my $sth;
@@ -164,28 +173,28 @@ if ( !-e $ptTableSync ) {
 
 #connect to every server
 #and check if the table and conflict-column exist
-for my $server_num ( 0 .. $#servers ) {
+foreach $server_id (sort (keys %servers)) {
 
-	print "Connecting ... host: $servers[$server_num]{host}  database:$servers[$server_num]{database}  \n";
-	my $db = DBI->connect( 'DBI:mysql:' . $servers[$server_num]{database} . ';host=' . $servers[$server_num]{host}.';mysql_connect_timeout=5;mysql_read_timeout=1',
-					$servers[$server_num]{username},
-					$servers[$server_num]{password} );
-				
-	push @dbh, $db;
+	print "Connecting ... host: $servers{$server_id}{host}  database:$servers{$server_id}{database}  \n";
+	my $db = DBI->connect( 'DBI:mysql:' . $servers{$server_id}{database} . ';host=' . $servers{$server_id}{host}.';mysql_connect_timeout=5;mysql_read_timeout=1',
+					$servers{$server_id}{username},
+					$servers{$server_id}{password} );
+			
+	$dbh{$server_id}=$db;	
 	
 
 	if ( defined $DBI::errstr ) {
-		$errorString = "\nCould not connect to database on server $servers[$server_num]{host}\n $DBI::errstr\n";
+		$errorString = "\nCould not connect to database on server $servers{$server_id}{host}\n $DBI::errstr\n";
 
 		#if we have a problem with the first server (the main one and the one running this script), we cannot proceed
-		if ( $server_num == 0 ) {
+		if ( $server_id == 1 ) {
 			errorMessage( 'critical', $errorString );
 		}
 
 		#if it not the main server, we just remove the server from the list and sync the rest
 		else {
 			errorMessage( 'warning', $errorString . "We will not sync this server and proceed with the next one (if any)\n\n" );
-			$servers[$server_num]{type} = "delete";
+			$servers{$server_id}{type} = "delete";
 			next;
 		}
 	}
@@ -194,22 +203,22 @@ for my $server_num ( 0 .. $#servers ) {
 	foreach my $table (@tableData) {
 
 		$sql = "show columns from `@$table[0]`";
-		$fields_hash = $dbh[$server_num]->selectall_hashref( $sql, "Field", \%DBattr );
+		$fields_hash = $dbh{$server_id}->selectall_hashref( $sql, "Field", \%DBattr );
 
 		#check if table exists
 		if ( defined $DBI::errstr ) {
 
-			$errorString = "\nDatabase Error on server $servers[$server_num]{host}\n $DBI::errstr\n";
+			$errorString = "\nDatabase Error on server $servers{$server_id}{host}\n $DBI::errstr\n";
 
 			#if we have a problem with the first server (the main one and the one running this script), we cannot proceed
-			if ( $server_num == 0 ) {
+			if ( $server_id == 1 ) {
 				errorMessage( 'critical', $errorString );
 			}
 
 			#if it not the main server, we just remove the server from the list and sync the rest
 			else {
 				errorMessage( 'warning', $errorString . "We will not sync this server and proceed with the next one (if any)\n\n" );
-				$servers[$server_num]{type} = "delete";
+				$servers{$server_id}{type} = "delete";
 				last;
 			}
 
@@ -224,24 +233,24 @@ for my $server_num ( 0 .. $#servers ) {
 				  . " does not exist in the table "
 				  . `@$table[0]`
 				  . " on the server "
-				  . $servers[$server_num]{host}
+				  . $servers{$server_id}{host}
 				  . " or its not of type 'timestamp' - please doublecheck the \@tableData list and the database on the server\n"
 				  . "We will not sync this server and proceed with the next one (if any)\n\n";
 
 				errorMessage( 'warning', $errorString );
-				$servers[$server_num]{type} = "delete";
+				$servers{$server_id}{type} = "delete";
 				last;
 
 			}
 		}
 	}
 
-	print "run preexecution comman on server " . $servers[$server_num]{host} . "\n";
-	$dbh[$server_num]->do( $preExecutionSQLcommand, undef, $servers[$server_num]{'id'} );
+	print "run preexecution command on server " . $servers{$server_id}{host} . "\n";
+	$dbh{$server_id}->do( $preExecutionSQLcommand, undef, $server_id );
 
 	if ( defined $DBI::errstr ) {
-		errorMessage( 'warning', " could not run preexecution comman on " . $servers[$server_num]{host} . "\n$DBI::errstr\n We will not sync this server and proceed with the next one (if any)\n\n" );
-		$servers[$server_num]{type} = "delete";
+		errorMessage( 'warning', " could not run preexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n We will not sync this server and proceed with the next one (if any)\n\n" );
+		$servers{$server_id}{type} = "delete";
 	}
 }
 
@@ -265,69 +274,136 @@ END {
 }
 
 #syncing all the servers the first time
-for my $server_num ( 1 .. $#servers ) {
-	syncServer( "first", $server_num );
+foreach $server_id (sort (keys %servers)) {
+	if ( $server_id != 1 ) {
+		syncServer( "first", $server_id );
+		
+		if (!exists $servers_to_retry{$server_id}) {
+			#make a time stamp on the hub
+			stampServer( 1, $server_id );
+
+			#stamp every server with a stamp from a server it has already data from
+			for ( my $i = 1 ; $i < $server_id ; $i++ ) {
+
+				  if (!exists $servers_to_retry{$i} and exists $servers{$i}) {
+				    stampServer( $server_id, $i );
+				  }				
+			}
+
+		}		
+		
+	}
 }
+
 
 #retry syncing failed servers
-print "Servers to retry:" . %servers_to_retry . "\n";
+my $print_string= "\nServers to retry:" . %servers_to_retry . "\n";
+print $print_string;
+$verboseOutput = $verboseOutput . $print_string;
 
+foreach my $server_id (keys %servers_to_retry){
+	syncServer( "firstretry", $server_id );
+	
+	if ($servers{$server_id}{type} ne 'delete')	{
+		#make a time stamp on the hub
+		stampServer( 1, $server_id );
 
-foreach my $servernum_to_retry (keys %servers_to_retry){
-	syncServer( "firstretry", $servernum_to_retry );
+		#stamp every server with a stamp from a server it has already data from
+		for ( my $i = 1 ; $i < $server_id ; $i++ ) {
+
+			   if (!exists $servers_to_retry{$i} and exists $servers{$i}) {
+			    stampServer( $server_id, $i );
+			  }				
+		}
+	}	
+	
 }
-
 
 #delete all servers that could not be synced even after a retry
 deleteMarkedServers();
 
 #count the remaining master servers
-for my $server_num ( 0 .. $#servers ) {
-	if ( $servers[$server_num]{type} eq "master" ) {
-		$count_master_servers = $count_master_servers + 1;
-	}
-	
-}
+$count_master_servers = scalar (grep { $servers{$_}{type} eq 'master' } (keys %servers));
+
 
 #if we have more than 2 masters we need to sync again
 #but also if there are just two masters and there are slaves between servers[0] and the second master
 #these slaves have to be sync again to get the data from the second master
 #there is also no need to sync again in there were no changes made at all
-if (( $count_master_servers > 2 || ( $count_master_servers == 2 && $servers[1]{type} ne "master" )) 
+if (( $count_master_servers > 2 || ( $count_master_servers == 2 && $servers{2}{type} ne "master" )) 
 	  && ($insertCount > 0 || $updateCount > 0) ) {
 
 	%servers_to_retry=();
 	
 	#sync every server (exept the last one) again to distribute the changes from the later servers to the earlier ones
-	for my $server_num ( 1 .. $#servers) {
-		syncServer( "second", $server_num );
-	}
+	foreach $server_id (sort (keys %servers)) {
+		if ( $server_id != 1 ) {
+			syncServer( "second", $server_id );
+	
+			if (!exists $servers_to_retry{$server_id})
+			{
+				#stamp every server with a stamp of the server it now got the data from
+				#(sort (keys %servers))[-1] gets the highest key (id) in the hash				
+				for ( my $i = (sort (keys %servers))[-1] ; $i > $server_id ; $i-- ) {
+					if (exists $servers{$i}) {
+						stampServer( $server_id, $i );
+					}
+				}
+			}			
+		}
+	}	
+	
+	#retry syncing failed servers
+	$print_string= "\nServers to retry:" . %servers_to_retry . "\n";
+	print $print_string;
+	$verboseOutput = $verboseOutput . $print_string;
+	
 	
 	#retry the failed ones
-	foreach my $servernum_to_retry (keys %servers_to_retry){
-		syncServer( "secondretry", $servernum_to_retry );
+	foreach my $server_id (keys %servers_to_retry){
+		syncServer( "secondretry", $server_id );
+		if ($servers{$server_id}{type} ne 'delete')
+		{
+			#stamp every server with a stamp of the server it now got the data from
+			for ( my $i = (sort (keys %servers))[-1] ; $i > $server_id ; $i-- ) {
+				if (exists $servers{$i}) {
+					stampServer( $server_id, $i );
+				}
+			}
+		}		
 	}	
-
 
 	#delete all servers that could not be synced even after a retry
 	deleteMarkedServers();
 
+} else {
+	#if there were no need for a second sync we know that every server has all information, so we can stamp all rest servers
+	foreach $server_id (sort (keys %servers)) {
+		if ( $server_id != 1 ) {
+			#stamp every server with a stamp of the server it now got the data from				
+			for ( my $i = (sort (keys %servers))[-1] ; $i > $server_id ; $i-- ) {
+				if (exists $servers{$i}) {
+					stampServer( $server_id, $i );
+				}
+			}			
+		}
+	}	
 }
 
 #running the postexecution command on every server
-for my $server_num ( 0 .. $#servers ) {
+foreach $server_id (sort (keys %servers)) {
 
-	print "run postexecution comman on server " . $servers[$server_num]{host} . "\n";
-	my $db = connectToMySQLServer ($server_num);
+	print "run postexecution command on server " . $servers{$server_id}{host} . "\n";
+	my $db = connectToMySQLServer ($server_id);
 	
 	if (!$db) {
-			errorMessage( 'warning', "could not run postexecution comman on " . $servers[$server_num]{host} . "\n" );
+			errorMessage( 'warning', "could not run postexecution command on " . $servers{$server_id}{host} . "\n" );
 	} else {
 	
-		$db->do( $postExecutionSQLcommand, undef, $servers[$server_num]{'id'} );
+		$db->do( $postExecutionSQLcommand, undef, $server_id );
 	
 		if ( defined $DBI::errstr ) {
-			errorMessage( 'warning', "could not run postexecution comman on " . $servers[$server_num]{host} . "\n$DBI::errstr\n" );
+			errorMessage( 'warning', "could not run postexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n" );
 	
 		}
 	
@@ -410,15 +486,12 @@ sendAdministratorEmail();
 sub deleteMarkedServers {
 
 	#delete all the servers with problems from the list
-	my $server_num = 0;
-	while ( $server_num <= $#servers ) {
-		if ( $servers[$server_num]{type} eq "delete" ) {
-			splice( @servers, $server_num, 1 );
-			splice( @dbh,     $server_num, 1 );
-		}
-		else {
-			$server_num++;
-		}
+	foreach $server_id (sort (keys %servers)) {
+		if ( $servers{$server_id}{type} eq "delete" ) {
+			delete ($servers{$server_id});
+			delete ($dbh{$server_id});		
+			
+		}	
 	}
 
 }
@@ -429,21 +502,24 @@ sub checkForConflicts {
 	my $host_to_change = $_[0];
 	my $record_id      = $_[1];
 	my $table_name     = $_[2];
-	my $server_num     = $_[3];
-	my $server_num_with_most_recent_change;
-	my $server_to_check_for_conflicts_num;
+	my $server_id      = $_[3];
+	my $server_id_with_most_recent_change;
+	my $server_to_check_for_conflicts_id;
 	my $time_of_oldest_log->{'this_time'} = '000-00-00';
-	print "Check for conflicts. record_id=$record_id Table: $table_name\n";
+
+	my $print_string= "Check for conflicts. record_id=$record_id Table: $table_name\n";
+	print $print_string;
+	$verboseOutput = $verboseOutput . "\n". $print_string;
 
 	#before the UPDATE statement the pt-sync-table tools shows us the server that was updated
 	#so the other one is the one with the most recent changes
 	#As we always sync from $server[0], the server with the most recent data must be either $server[0] or
 	#the one we are syncing just now.
-	if ( $host_to_change eq $servers[0]{host} ) {
-		$server_num_with_most_recent_change = $server_num;
+	if ( $host_to_change eq $servers{1}{host} ) {
+		$server_id_with_most_recent_change = $server_id;
 	}
 	else {
-		$server_num_with_most_recent_change = 0;
+		$server_id_with_most_recent_change = 1;
 	}
 
 	#check if there is a conflict with this table and record_id
@@ -458,15 +534,14 @@ sub checkForConflicts {
 
 			#if the actual server we are sycing with $server[0] is the winner, we have a new winner
 			#and we need to update the conflicts array
-			if ( $server_num_with_most_recent_change == $server_num ) {
+			if ( $server_id_with_most_recent_change == $server_id ) {
 
 				#the former winner is now also a looser
 				push( @{ $conflict->{'loosing_parties'} }, dclone $conflict->{'winning_party'} );
 
 				#find the new winner in the looser list, make it a winner and delete it from the looser list
-				#TODO can this realy ever happen?
 				for ( my $i = 0 ; $i < @{ $conflict->{'loosing_parties'} } ; $i++ ) {
-					if ( $conflict->{'loosing_parties'}[$i]{'server'}{'id'} eq $servers[$server_num_with_most_recent_change]{'id'} ) {
+					if ( $conflict->{'loosing_parties'}[$i]{'server'}{'id'} eq $server_id_with_most_recent_change ) {
 						$conflict->{'winning_party'} = dclone $conflict->{'loosing_parties'}[$i];
 						splice( $conflict->{'loosing_parties'}, $i, 1 );
 						last;
@@ -485,17 +560,19 @@ sub checkForConflicts {
 		#check for conflicts on all hosts exept the one with the most recent change
 		#a conflict is when there were an update on the same record since the last sync
 		#print "Checking for conflicts on other servers\n";
-		for $server_to_check_for_conflicts_num ( 0 .. $#servers ) {
+		foreach $server_to_check_for_conflicts_id (sort (keys %servers)) {
+		
+			#print "server_id_with_most_recent_change ".$server_id_with_most_recent_change . "\n";
+			#print "server_to_check_for_conflicts_id " . $server_to_check_for_conflicts_id ."\n";
 
 			#we just need to check master-servers, because slaves will be overwritten anyway
 			#and the server that has the most recent change don't need to be checked
-			if (    $server_to_check_for_conflicts_num != $server_num_with_most_recent_change
-				 && $servers[$server_to_check_for_conflicts_num]{type} eq "master" )
+			if (    $server_to_check_for_conflicts_id != $server_id_with_most_recent_change
+				 && $servers{$server_to_check_for_conflicts_id}{type} eq "master" )
 			{
 
-				#print $servers[$server_to_check_for_conflicts_num]{host} . "\n";
-
-				#The UNION in the Subquery makes sure  there is a date even if the server was never synct before
+				#TODO erklären was hier passiert
+				#The UNION in the Subquery makes sure  there is a date even if the server was never synced before
 				$sql = "SELECT  `change_log`.`timestamp` ,
 									`change_log`.comment,
 									`users`.`email`,
@@ -518,27 +595,27 @@ sub checkForConflicts {
 				my %loosing_party;
 
 				#see if we have a entry in the change_log
-				print "Get changelog from ".$servers[$server_to_check_for_conflicts_num]{host} . "\n";
+				
+				$print_string= "Get changelog from ".$servers{$server_to_check_for_conflicts_id}{host} . "\n";
+				print $print_string;
+				$verboseOutput = $verboseOutput . "\n". $print_string;
+				
 								
-				my $db = connectToMySQLServer ($server_to_check_for_conflicts_num);
+				my $db = connectToMySQLServer ($server_to_check_for_conflicts_id);
 				
 				if (!$db) {
-					errorMessage( 'warning', "could not check for conflicts on " . $servers[$server_to_check_for_conflicts_num]{host} . "\n" );
+					errorMessage( 'warning', "could not check for conflicts on " . $servers{$server_to_check_for_conflicts_id}{host} . "\n" );
 					
 				} else {
-					$change_log = $db->selectrow_hashref( $sql, undef, $servers[$server_num_with_most_recent_change]{id} );
+					$change_log = $db->selectrow_hashref( $sql, undef, $server_id_with_most_recent_change );
 					if ( defined $DBI::errstr ) {
-	
-						if ($DBI::errstr =~ /.*?Lost connection to MySQL server during query.*?/ or 
-							$DBI::errstr =~ /.*?Can\'t connect to MySQL server.*?/ or
-							$DBI::errstr =~ /.*?MySQL server has gone away.*?/) {
-							
-							errorMessage( 'warning', "could not check for conflicts on " . $servers[$server_to_check_for_conflicts_num]{host} . "\n$DBI::errstr\n" );
+						if ($DBI::errstr =~ $warning_errors ) {
+							errorMessage( 'warning', "could not check for conflicts on " . $servers{$server_to_check_for_conflicts_id}{host} . "\n$DBI::errstr\n" );
 	
 						}
 						#anything else will lead to an abbort
 						else {
-						   errorMessage( 'critical', "could not check for conflicts on " . $servers[$server_to_check_for_conflicts_num]{host} . "\n$DBI::errstr\n" );
+						   errorMessage( 'critical', "could not check for conflicts on " . $servers{$server_to_check_for_conflicts_id}{host} . "\n$DBI::errstr\n" );
 	
 						}
 					}
@@ -548,6 +625,8 @@ sub checkForConflicts {
 				
 				if ( defined $change_log ) {
 
+					print $change_log->{'timestamp'} . "\n";
+					 
 					#now we discovered a real conflict (the same row in the same table is changed on least two servers between
 					#the last sync and now)
 
@@ -571,8 +650,8 @@ sub checkForConflicts {
 					$loosing_party{'person'}{'full_name'} = $change_log->{'name'} . " " . $change_log->{'lastname'};
 					$loosing_party{'person'}{'user_name'} = $change_log->{'user_name'};
 					$loosing_party{'timestamp'}           = $change_log->{'timestamp'};
-					$loosing_party{'server'}{'host'}      = $servers[$server_to_check_for_conflicts_num]{'host'};
-					$loosing_party{'server'}{'id'}        = $servers[$server_to_check_for_conflicts_num]{'id'};
+					$loosing_party{'server'}{'host'}      = $servers{$server_to_check_for_conflicts_id}{'host'};
+					$loosing_party{'server'}{'id'}        = $server_to_check_for_conflicts_id;
 					push( @{ $conflict{'loosing_parties'} }, {%loosing_party} );
 
 				}
@@ -595,17 +674,17 @@ sub checkForConflicts {
 			$sql = substr( $sql, 0, length($sql) - 3 );
 			$sql = $sql . " ORDER BY this_time ASC LIMIT 1";
 
-			print "Get get time of the oldest log: $servers[$server_num_with_most_recent_change]{host}\n";
+			print "Get get time of the oldest log: $servers{$server_id_with_most_recent_change}{host}\n";
 			
-			my $db = connectToMySQLServer ($server_num_with_most_recent_change);
+			my $db = connectToMySQLServer ($server_id_with_most_recent_change);
 			if (!$db) {
-				errorMessage( 'warning', "could not get conflict member information from: " . $servers[$server_num_with_most_recent_change]{host} . "\n" );
+				errorMessage( 'warning', "could not get conflict member information from: " . $servers{$server_id_with_most_recent_change}{host} . "\n" );
 				
 			}
 			else {
 				$time_of_oldest_log = $db->selectrow_hashref($sql);
 				if ( defined $DBI::errstr ) {
-					errorMessage( 'warning', "could not get conflict member information from: " . $servers[$server_num_with_most_recent_change]{host} . "\n$DBI::errstr\n" );
+					errorMessage( 'warning', "could not get conflict member information from: " . $servers{$server_id_with_most_recent_change}{host} . "\n$DBI::errstr\n" );
 				} else {
 	
 					if ( not defined $time_of_oldest_log ) {    #if there were no sync before use 0000-00-00 as time
@@ -627,11 +706,11 @@ sub checkForConflicts {
 									ORDER BY `change_log`.`timestamp` DESC
 									LIMIT 1";
 		
-					print "Get more information about the conflict from: " . $servers[$server_num_with_most_recent_change]{host} . "\n";
+					print "Get more information about the conflict from: " . $servers{$server_id_with_most_recent_change}{host} . "\n";
 					$change_log = $db->selectrow_hashref($sql);
 		
 					if ( defined $DBI::errstr ) {
-						errorMessage( 'warning', "could not get conflict member information from: " . $servers[$server_num_with_most_recent_change]{host} . "\n$DBI::errstr\n" );
+						errorMessage( 'warning', "could not get conflict member information from: " . $servers{$server_id_with_most_recent_change}{host} . "\n$DBI::errstr\n" );
 					}
 				}
 				
@@ -642,7 +721,7 @@ sub checkForConflicts {
 			#the one just received the changes was not online at that time to be checked for conflicts
 			if (!defined $change_log->{'user_name'}) {
 
-				errorMessage( 'warning', "could not find information about the winning party on: " . $servers[$server_num_with_most_recent_change]{host} . "\nProbably there was a network problem during the last sync\ntry to get information about winning party from sync_log\n" );
+				errorMessage( 'warning', "could not find information about the winning party on: " . $servers{$server_id_with_most_recent_change}{host} . "\nProbably there was a network problem during the last sync\ntry to get information about winning party from sync_log\n" );
 								
 				$sql = "SELECT  `sync_log`.`comment`,
 								`sync_log`.`site_id_from`
@@ -652,30 +731,25 @@ sub checkForConflicts {
 										AND `record_id` = '$record_id'
 										AND `timestamp` > '$time_of_oldest_log->{'this_time'}'
 										AND `user_id` IS NOT NULL
-										AND `site_id_to` = $servers[0]->{'id'}
+										AND `site_id_to` = '1'
 								ORDER BY `timestamp` DESC
 								LIMIT 1";				
 				
 				#TODO sollen wir hier auch zu $db ändern?
-				my $sync_log = $dbh[0]->selectrow_hashref($sql);
+				my $sync_log = $dbh{1}->selectrow_hashref($sql);
 
+				#print "\n". $sql . "\n" . $sync_log->{'comment'} . "\n\n";
 				$change_log = eval $sync_log->{'comment'};
 				$change_log = $change_log->{'user_info'};
 				
 				$conflict{'winning_party'}{'server'}{'id'}        = $sync_log->{'site_id_from'};
-				
-				#TODO das ist doch mist id und num sollte das gleiche sein
-				for my $server_num ( 0 .. $#servers ) {
-					if ($conflict{'winning_party'}{'server'}{'id'}  == $servers[$server_num]{'id'}) {
-						$conflict{'winning_party'}{'server'}{'host'}      = $servers[$server_num]{'host'};
-						last;
-					}
-				}				
+				$conflict{'winning_party'}{'server'}{'host'}      = $servers{$sync_log->{'site_id_from'}}{'host'};
+						
 				
 				
 			} else {
-				$conflict{'winning_party'}{'server'}{'host'}      = $servers[$server_num_with_most_recent_change]{'host'};
-				$conflict{'winning_party'}{'server'}{'id'}        = $servers[$server_num_with_most_recent_change]{'id'};				
+				$conflict{'winning_party'}{'server'}{'host'}      = $servers{$server_id_with_most_recent_change}{'host'};
+				$conflict{'winning_party'}{'server'}{'id'}        = $server_id_with_most_recent_change;				
 			}
 
 			$conflict{'winning_party'}{'comment'}             = $change_log->{'comment'};
@@ -693,22 +767,23 @@ sub checkForConflicts {
 
 sub syncServer {
 	my $runIdentifier   = $_[0]; #can be: "first,second,firstretry,secondretry"
-	my $server_num = $_[1];
+	my $server_id = $_[1];
 	my $stopSyncingThisServer = 0; #will be set to 1 in case of a "retry" error
 	my $print_string;
+	my $server_to_check_for_conflicts_id;
 
 	foreach my $table (@tableData) {
 		$command = "$ptTableSync ";
 
 		#for the second run we don't need bidirectional syncinng as we just destributing the canges from the later sync servers.
-		if ( $servers[$server_num]{type} eq 'master'  and ($runIdentifier eq "first" or $runIdentifier eq "firstretry")) {
+		if ( $servers{$server_id}{type} eq 'master'  and ($runIdentifier eq "first" or $runIdentifier eq "firstretry")) {
 			$command = $command . " --bidirectional ";
 		}
 		$command =
 		    $command
-		  . "h=$servers[0]{host},D=$servers[0]{database},t=@$table[0],u=$servers[0]{username},p=$servers[0]{password} "
-		  . "h=$servers[$server_num]{host},D=$servers[$server_num]{database},u=$servers[0]{username},p=$servers[$server_num]{password} "
-		  . " --conflict-column @$table[1] $syncCommandAdditionalAttributes";
+		  . "h=$servers{1}{host},D=$servers{1}{database},t=@$table[0],u=$servers{1}{username},p=$servers{1}{password} "
+		  . "h=$servers{$server_id}{host},D=$servers{$server_id}{database},u=$servers{1}{username},p=$servers{$server_id}{password} "
+		  . " --conflict-column @$table[1] --ignore-columns @$table[1] $syncCommandAdditionalAttributes";
 		
 		if ( $runIdentifier eq 'firstretry' or  $runIdentifier eq 'secondretry' ) {
 			print "retry ";
@@ -724,7 +799,7 @@ sub syncServer {
 		}
 		
 
-		$print_string = " server: $servers[$server_num]{host} -  table : '@$table[0]' - conflict column: '@$table[1]'\n";
+		$print_string = " server: $servers{$server_id}{host} -  table : '@$table[0]' - conflict column: '@$table[1]'\n";
 		print $print_string;
 		$verboseOutput = $verboseOutput . $print_string;
 
@@ -751,7 +826,8 @@ sub syncServer {
 
 			#found a UPDATE statment!
 			my $sql_statement = $_;
-			if ($sql_statement =~ /\/\*(.*)\*\/ UPDATE `($servers[0]{database}|$servers[$server_num]{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\;/ ) 
+			my $first_server_id = 1;
+			if ($sql_statement =~ /\/\*(.*)\*\/ UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\;/ ) 
 			{
 				
 				$updateCount = $updateCount + 1;
@@ -759,7 +835,7 @@ sub syncServer {
 				my $host_to_change = $1;
 				my $record_id = $3;
 				
-				wrileSyncLog('UPDATE',$server_num,$host_to_change,@$table[0],$record_id,$sql_statement);
+				wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
 			
 				#in the first round of syncing we have to check for conflicts. But we don't need the conflict checks in the second
 				#round of syncing, because all conflict information should be there after the first round.
@@ -768,41 +844,39 @@ sub syncServer {
 					
 					#we just need to check for conflicts if the server we just updated was a master server
 					#slaves will be overwritten anyway
-					for my $server_to_check_for_conflicts_num ( 0 .. $#servers ) {
-						if ( $servers[$server_to_check_for_conflicts_num]{host} eq $host_to_change ) {
-							if ( $servers[$server_to_check_for_conflicts_num]{type} eq 'master' ) {
-								checkForConflicts( $host_to_change, $record_id, @$table[0], $server_num );
-							}
-							last;
-						}
+					$server_to_check_for_conflicts_id = grep { $servers{$_}{host} eq $host_to_change } keys %servers;
+					
+					if ( $servers{$server_to_check_for_conflicts_id}{type} eq 'master' ) {
+						#TODO we could use $server_to_check_for_conflicts_id and replace $host_to_change here
+						checkForConflicts( $host_to_change, $record_id, @$table[0], $server_id );
 					}
 				}
 				
 			} 
 			#this case hapends for the one way syncs
-			elsif ($sql_statement =~ /UPDATE `($servers[0]{database}|$servers[$server_num]{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\s+\/\*percona-toolkit src_db:($servers[0]{database}|$servers[$server_num]{database}) src_tbl:@$table[0] src_dsn:D=($servers[0]{database}|$servers[$server_num]{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers[0]{database}|$servers[$server_num]{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
+			elsif ($sql_statement =~ /UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
 				$updateCount = $updateCount + 1;
 				my $host_to_change = $7;	
 				my $record_id = $2;			
-				wrileSyncLog('UPDATE',$server_num,$host_to_change,@$table[0],$record_id,$sql_statement);				
+				wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
 				
 			} 
-			elsif ($sql_statement =~ /\/\*(.*)\*\/ INSERT INTO `($servers[0]{database}|$servers[$server_num]{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\;/) {
+			elsif ($sql_statement =~ /\/\*(.*)\*\/ INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\;/) {
 
 				$insertCount = $insertCount + 1;
 				
 				#before the INSERT statement the pt-sync-table tools shows us the server that was updated this is $1
 				my $host_to_change = $1;	
 				my $record_id = $3;			
-				wrileSyncLog('INSERT',$server_num,$host_to_change,@$table[0],$record_id,$sql_statement);
+				wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
 			} 
-			elsif ($sql_statement =~ /INSERT INTO `($servers[0]{database}|$servers[$server_num]{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\s+\/\*percona-toolkit src_db:($servers[0]{database}|$servers[$server_num]{database}) src_tbl:@$table[0] src_dsn:D=($servers[0]{database}|$servers[$server_num]{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers[0]{database}|$servers[$server_num]{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
+			elsif ($sql_statement =~ /INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
 
 				$insertCount = $insertCount + 1;
 
 				my $host_to_change = $7;	
 				my $record_id = $2;			
-				wrileSyncLog('INSERT',$server_num,$host_to_change,@$table[0],$record_id,$sql_statement);				
+				wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
 			}
 		}
 
@@ -812,22 +886,19 @@ sub syncServer {
 		#if there was an error during the sync check the severity
 		while (<CATCHERR>) {
 				#when this errors occure we will try it again
-				if ($_ =~ /.*Lost connection to MySQL server during query.*/ or 
-							$_ =~ /.*Can\'t connect to MySQL server.*/ or
-							$_ =~ /.*MySQL server has gone away.*/ or
-							$_ =~ /.*Issuing rollback.*/) {
+				if ($_ =~ $warning_errors ) {
 					
 					$stopSyncingThisServer=1;
 					#if its already the retry run then mark the server as to be deleted and give a warning
 					if ($runIdentifier eq 'firstretry' or $runIdentifier eq 'secondretry') {
-						errorMessage( 'warning',  $_);
-						$servers[$server_num]{type} = "delete";
+						errorMessage( 'warning', $_ . "\nWe will not sync the server " .$servers{$server_id}{host} . " and proceed with the next one (if any)\n\n" );
+						$servers{$server_id}{type} = "delete";
 						$stopSyncingThisServer=1;
 					}
 					
 					#if the error comes the first time we will retry to sync the server later
 					else {
-						errorMessage( 'retry',  $_, $server_num);
+						errorMessage( 'retry',  $_, $server_id);
 						
 						}
 				}
@@ -854,16 +925,16 @@ sub syncServer {
 	#we don't try to sync the files if the sync was aborted during the database sync
 	if ($stopSyncingThisServer == 0) {
 
-		print "Syncing files with $servers[$server_num]{host}\n";
+		print "Syncing files with $servers{$server_id}{host}\n";
 	
 		$command =
 		    "$unison -silent  -logfile $unisonLogFile -ui text -batch "
-		  . " -nodeletion $servers[0]{pathOfFilesToSync}  -nodeletion ssh://$servers[$server_num]{host}/$servers[$server_num]{pathOfFilesToSync}"
-		  . " $servers[0]{pathOfFilesToSync} ssh://$servers[$server_num]{host}/$servers[$server_num]{pathOfFilesToSync}";
+		  . " -nodeletion $servers{1}{pathOfFilesToSync}  -nodeletion ssh://$servers{$server_id}{host}/$servers{$server_id}{pathOfFilesToSync}"
+		  . " $servers{1}{pathOfFilesToSync} ssh://$servers{$server_id}{host}/$servers{$server_id}{pathOfFilesToSync}";
 	
 		#for the second run we don't need bidirectional syncinng as we just destributing the canges from the later sync servers.
-		if ( $servers[$server_num]{type} eq 'slave' or $runIdentifier eq "second" or $runIdentifier eq "secondretry") {
-			$command = $command . " -nocreation $servers[0]{pathOfFilesToSync}  -noupdate $servers[0]{pathOfFilesToSync}";
+		if ( $servers{$server_id}{type} eq 'slave' or $runIdentifier eq "second" or $runIdentifier eq "secondretry") {
+			$command = $command . " -nocreation $servers{1}{pathOfFilesToSync}  -noupdate $servers{1}{pathOfFilesToSync}";
 		}
 	
 		local *CATCHERR = IO::File->new_tmpfile;
@@ -881,64 +952,11 @@ sub syncServer {
 			if ( $_ =~ /Synchronization\scomplete\sat.*/ ) {
 				$fileSyncSummary =
 				    $fileSyncSummary
-				  . "Synced files between $servers[0]{host}/$servers[$server_num]{pathOfFilesToSync}"
-				  . " and $servers[$server_num]{host}/$servers[$server_num]{pathOfFilesToSync}\n"
+				  . "Synced files between $servers{1}{host}/$servers{$server_id}{pathOfFilesToSync}"
+				  . " and $servers{$server_id}{host}/$servers{$server_id}{pathOfFilesToSync}\n"
 				  . $_;
 	
 				print $_;
-			}
-		}
-	
-		if ($runIdentifier eq "first") {
-			if (!exists $servers_to_retry{$server_num})
-			{
-				#make a time stamp on the hub
-				stampServer( 0, $server_num );
-	
-				#stamp every server with a stamp from a server it has already data from
-				for ( my $i = 0 ; $i < $server_num ; $i++ ) {
-
-					  if (!exists $servers_to_retry{$i}) {
-					    stampServer( $server_num, $i );
-					  }				
-				}
-
-			}
-	
-		} 
-		elsif ($runIdentifier eq "firstretry") {
-	
-			if ($servers[$server_num]{type} ne 'delete')
-			{
-				#make a time stamp on the hub
-				stampServer( 0, $server_num );
-	
-				#stamp every server with a stamp from a server it has already data from
-				for ( my $i = 0 ; $i < $server_num ; $i++ ) {
-
-					   if (!exists $servers_to_retry{$i}) {
-					    stampServer( $server_num, $i );
-					  }				
-				}
-			}
-	
-		}
-		elsif ($runIdentifier eq "second") {
-			if (!exists $servers_to_retry{$server_num})
-			{
-				#stamp every server with a stamp of the server it now got the data from
-				for ( my $i = $#servers ; $i > $server_num ; $i-- ) {
-					stampServer( $server_num, $i );
-				}
-			}
-		}
-		elsif ($runIdentifier eq "secondretry") {
-			if ($servers[$server_num]{type} ne 'delete')
-			{
-				#stamp every server with a stamp of the server it now got the data from
-				for ( my $i = $#servers ; $i > $server_num ; $i-- ) {
-					stampServer( $server_num, $i );
-				}
 			}
 		}
 	}
@@ -946,32 +964,24 @@ sub syncServer {
 
 sub wrileSyncLog {
 	my $write_type		= $_[0];
-	my $server_num		= $_[1];
+	my $server_id		= $_[1];
 	my $host_to_change	= $_[2];
 	my $table			= $_[3];
 	my $record_id 		= $_[4];
 	my $sql_statement 	= $_[5];
 	my $host_id_from 	= 1;
 	my $host_id_to 		= 1;
-	my $host_num_to		= 0;
-	my $host_num_from	= 0;
 	my $change_log;
 	my $comment;
 	my $print_string;
 	
-	if ($host_to_change ne $servers[$server_num]{host}) {
-		$host_id_from = $servers[$server_num]{id};
+	if ($host_to_change ne $servers{$server_id}{host}) {
+		$host_id_from = $server_id;
+	} else {
+		$host_id_to = $server_id;
 	}
 	
-	for my $server_num_loop ( 0 .. $#servers ) {
-		if ($host_to_change eq $servers[$server_num_loop]{host}) {
-			$host_id_to = $servers[$server_num_loop]{id};
-			$host_num_to = $server_num_loop;
-		}
-		if ($host_id_from == $servers[$server_num_loop]{id}) {
-			$host_num_from = $server_num_loop;
-		}		
-	}	
+
 	
 	
 	#get details about the user wrote that change
@@ -997,14 +1007,14 @@ sub wrileSyncLog {
 				LIMIT 1";
 
 	#see if we have a entry in the change_log
-	$print_string= "Get changelog from ".$servers[$host_num_from]{host} . " for writing sync_log\n";
+	$print_string= "Get changelog from ".$servers{$host_id_from}{host} . " for writing sync_log\n";
 	print $print_string;
-	$verboseOutput = $verboseOutput .  $print_string;
+	$verboseOutput = $verboseOutput . "\n". $print_string;
 
 	
-	my $db = connectToMySQLServer ($host_num_from);
+	my $db = connectToMySQLServer ($host_id_from);
 	if (!$db) {
-		errorMessage( 'warning', "could not get the changelog from: " . $servers[$host_num_from]{host} . "\n" );
+		errorMessage( 'warning', "could not get the changelog from: " . $servers{$host_id_from}{host} . "\n" );
 		$change_log->{'comment'} = "unknown";
 		$change_log->{'email'} = "unknown";
 		$change_log->{'name'} = "unknown";
@@ -1013,14 +1023,12 @@ sub wrileSyncLog {
 	}
 	else {		
 		
-		$change_log = $db->selectrow_hashref( $sql, undef, $servers[$host_num_to]{id} );
+		$change_log = $db->selectrow_hashref( $sql, undef, $host_id_to );
 		if ( defined $DBI::errstr ) {
 	
-			if ($DBI::errstr =~ /.*?Lost connection to MySQL server during query.*?/ or 
-				$DBI::errstr =~ /.*?Can\'t connect to MySQL server.*?/ or
-				$DBI::errstr =~ /.*?MySQL server has gone away.*?/) {
+			if ($DBI::errstr =~ $warning_errors) {
 				
-				errorMessage( 'warning', "could not get the changelog from: " . $servers[$host_num_from]{host} . "\n$DBI::errstr\n" );
+				errorMessage( 'warning', "could not get the changelog from: " . $servers{$host_id_from}{host} . "\n$DBI::errstr\n" );
 				$change_log->{'comment'} = "unknown";
 				$change_log->{'email'} = "unknown";
 				$change_log->{'name'} = "unknown";
@@ -1030,7 +1038,7 @@ sub wrileSyncLog {
 			}
 			#anything else will lead to an abbort
 			else {
-			   errorMessage( 'critical', "could not get the changelog from: " . $servers[$host_num_from]{host} . "\n$DBI::errstr\n" );
+			   errorMessage( 'critical', "could not get the changelog from: " . $servers{$host_id_from}{host} . "\n$DBI::errstr\n" );
 	
 			}	
 		}
@@ -1051,7 +1059,7 @@ sub wrileSyncLog {
 	$Data::Dumper::Terse = 1;
 	#$Data::Dumper::Varname = "sync_info";
  	$comment = Dumper({'user_info'=>$change_log,'sql'=>$sql_statement});
-	$dbh[0]->do( $sql, undef, @{[$host_id_from, $host_id_to,$table,$record_id,$write_type,$change_log->{'id'},$comment]});
+	$dbh{1}->do( $sql, undef, @{[$host_id_from, $host_id_to,$table,$record_id,$write_type,$change_log->{'id'},$comment]});
 	if ( defined $DBI::errstr ) {
 		errorMessage( 'critical', "could not write sync_log  \n$DBI::errstr\n" );
 	}	
@@ -1062,24 +1070,25 @@ sub wrileSyncLog {
 
 
 sub stampServer {
-	my $server_num_to_stamp      = $_[0];
-	my $server_num_got_data_from = $_[1];
+	my $server_id_to_stamp      = $_[0];
+	my $server_id_got_data_from = $_[1];
 	my $sql_for_sync_stamp       = "INSERT INTO sync (sync_from,this_time) VALUES (?,NOW())
  			  			  			ON DUPLICATE KEY UPDATE last_time=this_time, this_time=NOW();";
 
+	print "Stamping Server $servers{$server_id_to_stamp}{host} to be sync from $servers{$server_id_got_data_from}{host}\n";
+
 	#we just stamp if the server we supposedly got data from is a master
 	#as no server should not get ever data from a slave, we don't stamp server as sync_from a slave
-	if ( $servers[$server_num_got_data_from]{'type'} eq 'master' ) {
+	if ( $servers{$server_id_got_data_from}{'type'} eq 'master' ) {
 
-		my $db = connectToMySQLServer ($server_num_to_stamp);
+		my $db = connectToMySQLServer ($server_id_to_stamp);
 		if (!$db) {
-			errorMessage( 'warning', "could not stamp  " . $servers[$server_num_to_stamp]{host} . "\n" );
-	
+			errorMessage( 'warning', "could not stamp  " . $servers{$server_id_to_stamp}{host} . "\n" );	
 		}
 		else {	
-			$db->do( $sql_for_sync_stamp, undef, $servers[$server_num_got_data_from]{'id'} );
+			$db->do( $sql_for_sync_stamp, undef, $server_id_got_data_from );
 			if ( defined $DBI::errstr ) {
-				errorMessage( 'warning', "could not stamp  " . $servers[$server_num_to_stamp]{host} . "\n$DBI::errstr\n" );
+				errorMessage( 'warning', "could not stamp  " . $servers{$server_id_to_stamp}{host} . "\n$DBI::errstr\n" );
 			}
 			$db->disconnect;
 		}
@@ -1089,43 +1098,93 @@ sub stampServer {
 #$_[0] is the level and can be "warning" or "critical", warning prints the message, critical stops the execution
 #$_[1] is the actual error message
 sub errorMessage {
-	my $level   = $_[0];
-	my $message = $_[1];
-	my $server_num = $_[2];
 	my $print_string;
+	my %error;
 	
-	$errorOutput = $errorOutput . $message;
+	$error{level} = $_[0];
+	$error{message} = $_[1];
+	$error{server_id} = $_[2];
+	
+	push @errors, {%error};
+	
+	#$errorOutput = $errorOutput . $error{message};
 
-	if ( $level eq "critical" ) {
-		$errorOutput = "CRITICAL ERROR:\n----------------- \n" . $errorOutput . "\n ----------------- STOP execution\n";
+	if ( $error{level} eq "critical" ) {
+		#$errorOutput = "CRITICAL ERROR:\n----------------- \n" . $errorOutput . "\n ----------------- STOP execution\n";
 		printErrorsAndSummary();
 		sendAdministratorEmail();
 		die;
 	}
-	elsif ( $level eq "retry" ) {
-		$print_string= "RETRY ERROR:\n" . $message . "\nWe will stop syncing the server " . $servers[$server_num]{host} . " and try later again\n\n";
+	elsif ( $error{level} eq "retry" ) {
+		$print_string= "RETRY ERROR:\n" . $error{message} . "\nWe will stop syncing the server " . $servers{$error{server_id}}{host} . " and try later again\n\n";
 		$verboseOutput = $verboseOutput .  $print_string;
 		print $print_string;
-  		if (!exists $servers_to_retry{$server_num})
-			{
-				print $server_num ." not found\n";
-				$verboseOutput = $verboseOutput .  $server_num ." not found\n";
-				
-  	  			$servers_to_retry{$server_num}=1;
+  		if (!exists $servers_to_retry{$error{server_id}})
+			{			
+  	  			$servers_to_retry{$error{server_id}}=1;
 			}
 
 	}
 	else {
-		print "ERROR:\n " . $message . "\n";
+		$print_string = "WARNING:\n " . $error{message} . "\n";
+		$verboseOutput = $verboseOutput .  $print_string;
+		print $print_string;
+		
 	}
 }
 
 sub printErrorsAndSummary {
 
-	if ( $errorOutput ne "" ) {
-		print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
-		print "ERROR:\n" . $errorOutput;
-		print "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+	my @warnings = grep { $_->{level} eq 'warning' } @errors;
+	my $warningsText;
+	if (scalar (@warnings) > 0) {
+		
+	
+		$warningsText = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+		$warningsText = $warningsText . "WARNINGS:\n";
+		foreach (@warnings) {
+			
+			$warningsText = $warningsText . $_->{message} . "\n----------------------------------------------\n";
+			$emailSubjectPostfix         = " finished with WARNINGS!";
+		}
+		
+		$warningsText = $warningsText . "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+			
+		print $warningsText;
+		$errorOutput = $errorOutput . $warningsText;	
+	}
+		
+
+
+	my @retryErrors = grep { $_->{level} eq 'retry' } @errors;
+	my $retryErrorsText;
+	if (scalar (@retryErrors) > 0) {
+		
+		$retryErrorsText = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+		$retryErrorsText = $retryErrorsText . "ERRORS THAT CAUSES A RETRY OF SYNC:\n";
+		foreach (@retryErrors) {
+			$retryErrorsText = $retryErrorsText . $_->{message} . "\n----------------------------------------------\n";		
+		}
+		
+		$retryErrorsText = $retryErrorsText . "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+			
+		print $retryErrorsText;
+		$errorOutput = $errorOutput . $retryErrorsText;	
+	}
+
+
+	my @criticalErrors = grep { $_->{level} eq 'critical' } @errors;
+	my $criticalErrorsText;
+	if (scalar (@criticalErrors) > 0) {	
+		
+		$criticalErrorsText = "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n";
+		$criticalErrorsText = $criticalErrorsText . "CRITICAL ERROR:\n";
+		$criticalErrorsText = $criticalErrorsText . $criticalErrors[0]->{message} . "\n";
+		$criticalErrorsText = $criticalErrorsText . "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n";
+			
+		print $criticalErrorsText;
+		$errorOutput = $errorOutput . $criticalErrorsText;	
+		$emailSubjectPostfix         = " ERROR - could not finish syncronization!";
 	}
 
 	$syncSummary =
@@ -1153,7 +1212,6 @@ sub sendAdministratorEmail {
 
 	my $administratorEmailData = "";
 	my $verboseOutputFH;
-	my $subjectPostfix = "";
 	my $verboseOutputFile;
 
 	# try new temporary filenames until we get one that didn't already exist
@@ -1164,7 +1222,6 @@ sub sendAdministratorEmail {
 
 	if ( $errorOutput ne "" ) {
 		$administratorEmailData = $errorOutput . "\n";
-		$subjectPostfix         = " ERROR!";
 	}
 
 	#write verbose informations to file
@@ -1177,7 +1234,7 @@ sub sendAdministratorEmail {
 	my $msg = MIME::Lite->new(
 							   From    => $emailFromAddress,
 							   To      => $administratorAddresses,
-							   Subject => 'INF personnel database syncronization report!' . $subjectPostfix,
+							   Subject => 'INF personnel database syncronization report!' . $emailSubjectPostfix,
 							   Type    => 'TEXT',
 							   Data    => $administratorEmailData
 	);
@@ -1204,17 +1261,15 @@ sub sendAdministratorEmail {
 }
 
 sub connectToMySQLServer {
-	my $server_num   = $_[0];
+	my $server_id   = $_[0];
 	
-	my $db = DBI->connect( 'DBI:mysql:' . $servers[$server_num]{database} . ';host=' . $servers[$server_num]{host}.';mysql_connect_timeout=5;mysql_read_timeout=1',
-					$servers[$server_num]{username},
-					$servers[$server_num]{password} );
+	my $db = DBI->connect( 'DBI:mysql:' . $servers{$server_id}{database} . ';host=' . $servers{$server_id}{host}.';mysql_connect_timeout='.$mysql_connect_timeout.';mysql_read_timeout='. $mysql_read_timeout,
+					$servers{$server_id}{username},
+					$servers{$server_id}{password} );
 					
 	if ( defined $DBI::errstr ) {
 		return 0;
 	} else {
 		return $db;
 	}
-	
-	
 }
