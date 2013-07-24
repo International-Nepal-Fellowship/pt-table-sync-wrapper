@@ -2,7 +2,7 @@
 
 #Autor: Artur Neumann INF/N ict.projects@nepal.inf.org
 #Version: see $version variable
-#last change: 2013.07.23
+#last change: 2013.07.24
 #This script is written to syncronize the INF personnel database on different server
 #Its written arround pt-table-sync: http://www.percona.com/doc/percona-toolkit
 #and unison: http://www.cis.upenn.edu/~bcpierce/unison/
@@ -36,7 +36,7 @@ use MIME::Base64;
 
 #Variables to configure
 #------------------------------------------------------
-my $version = "2.3";
+my $version = "2.3.1";
 my $ptTableSync = "/usr/bin/pt-table-sync";    #install from http://www.percona.com/doc/percona-toolkit/2.1/installation.html
 my $syncCommandAdditionalAttributes = " --print --execute --conflict-comparison newest --verbose --conflict-error die --function MD5";
 my $emailFromAddress                = 'yourmail@company.org';
@@ -176,9 +176,7 @@ if ( !-e $ptTableSync ) {
 foreach $server_id (sort (keys %servers)) {
 
 	print "Connecting ... host: $servers{$server_id}{host}  database:$servers{$server_id}{database}  \n";
-	my $db = DBI->connect( 'DBI:mysql:' . $servers{$server_id}{database} . ';host=' . $servers{$server_id}{host}.';mysql_connect_timeout=5;mysql_read_timeout=1',
-					$servers{$server_id}{username},
-					$servers{$server_id}{password} );
+	my $db = connectToMySQLServer ($server_id);
 			
 	$dbh{$server_id}=$db;	
 	
