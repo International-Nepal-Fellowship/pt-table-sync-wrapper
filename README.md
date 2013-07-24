@@ -44,3 +44,5 @@ More robust when link goes down during sync
 * code cleanup
 * clearer messages & better error reporting
 * bugfixes
+###2.3 -> 2.3.1 ###
+* minor code cleanup
