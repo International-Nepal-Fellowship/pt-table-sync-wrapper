@@ -2,7 +2,7 @@
 
 #Autor: Artur Neumann INF/N ict.projects@nepal.inf.org
 #Version: see $version variable
-#last change: 2013.07.24
+#last change: 2013.07.25
 #This script is written to syncronize the INF personnel database on different server
 #Its written arround pt-table-sync: http://www.percona.com/doc/percona-toolkit
 #and unison: http://www.cis.upenn.edu/~bcpierce/unison/
@@ -36,7 +36,7 @@ use MIME::Base64;
 
 #Variables to configure
 #------------------------------------------------------
-my $version = "2.3.1";
+my $version = "2.3.2";
 my $ptTableSync = "/usr/bin/pt-table-sync";    #install from http://www.percona.com/doc/percona-toolkit/2.1/installation.html
 my $syncCommandAdditionalAttributes = " --print --execute --conflict-comparison newest --verbose --conflict-error die --function MD5";
 my $emailFromAddress                = 'yourmail@company.org';
@@ -328,8 +328,7 @@ $count_master_servers = scalar (grep { $servers{$_}{type} eq 'master' } (keys %s
 #but also if there are just two masters and there are slaves between servers[0] and the second master
 #these slaves have to be sync again to get the data from the second master
 #there is also no need to sync again in there were no changes made at all
-if (( $count_master_servers > 2 || ( $count_master_servers == 2 && $servers{2}{type} ne "master" )) 
-	  && ($insertCount > 0 || $updateCount > 0) ) {
+if ( $count_master_servers > 2 && ($insertCount > 0 || $updateCount > 0) ) {
 
 	%servers_to_retry=();
 	

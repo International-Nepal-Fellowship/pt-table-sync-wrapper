@@ -48,3 +48,6 @@ More robust when link goes down during sync
 
 ###2.3 -> 2.3.1 ###
 * minor code cleanup
+
+###2.3.1 -> 2.3.2 ###
+* minor bugfix
