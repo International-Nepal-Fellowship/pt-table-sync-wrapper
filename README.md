@@ -51,3 +51,7 @@ More robust when link goes down during sync
 
 ###2.3.1 -> 2.3.2 ###
 * minor bugfix
+
+###2.3.2 -> 2.3.3 ###
+* hides passwords given to pt-table-sync
+* more errors are rated as "warnings" instead of "critical"

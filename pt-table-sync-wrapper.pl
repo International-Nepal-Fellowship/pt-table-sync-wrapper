@@ -2,7 +2,7 @@
 
 #Autor: Artur Neumann INF/N ict.projects@nepal.inf.org
 #Version: see $version variable
-#last change: 2013.07.25
+#last change: 2013.07.30
 #This script is written to syncronize the INF personnel database on different server
 #Its written arround pt-table-sync: http://www.percona.com/doc/percona-toolkit
 #and unison: http://www.cis.upenn.edu/~bcpierce/unison/
@@ -27,7 +27,6 @@ use POSIX qw/strftime/;
 use POSIX qw/tmpnam/;
 
 use MIME::Lite;    # to intall on ubuntu run 'sudo apt-get install libmime-lite-perl'
-use Symbol qw(gensym);
 use IO::File;
 use Storable qw(dclone);
 
@@ -36,7 +35,7 @@ use MIME::Base64;
 
 #Variables to configure
 #------------------------------------------------------
-my $version = "2.3.2";
+my $version = "2.3.3";
 my $ptTableSync = "/usr/bin/pt-table-sync";    #install from http://www.percona.com/doc/percona-toolkit/2.1/installation.html
 my $syncCommandAdditionalAttributes = " --print --execute --conflict-comparison newest --verbose --conflict-error die --function MD5";
 my $emailFromAddress                = 'yourmail@company.org';
@@ -139,7 +138,9 @@ my $server_id;
 my $emailSubjectPostfix = "";
 
 #This are MySQL and percona table sync error that just lead to a warning and a retry, all other errors will cause a abbort
-my $warning_errors = ".*?((Lost connection to MySQL server)|(Can\'t connect to MySQL server)|(MySQL server has gone away)|(Issuing rollback)).*?";
+#The Table does not exist error is also just a warning error because $warning_errors is checked while syncing, 
+#we have checked the DB structure before, so if this error occures during the sync there were connection problems
+my $warning_errors = ".*?((Lost connection to MySQL server)|(Can\'t connect to MySQL server)|(MySQL server has gone away)|(Issuing rollback)|(Attribute \(innodb_version\) does not pass the type constraint because: Validation failed for \'Str\' with value undef)|(Table .*\..* does not exist on)).*?";
 
 
 my $sql;
@@ -332,7 +333,7 @@ if ( $count_master_servers > 2 && ($insertCount > 0 || $updateCount > 0) ) {
 
 	%servers_to_retry=();
 	
-	#sync every server (exept the last one) again to distribute the changes from the later servers to the earlier ones
+	#sync every server again to distribute the changes from the later servers to the earlier ones
 	foreach $server_id (sort (keys %servers)) {
 		if ( $server_id != 1 ) {
 			syncServer( "second", $server_id );
@@ -778,9 +779,9 @@ sub syncServer {
 		}
 		$command =
 		    $command
-		  . "h=$servers{1}{host},D=$servers{1}{database},t=@$table[0],u=$servers{1}{username},p=$servers{1}{password} "
-		  . "h=$servers{$server_id}{host},D=$servers{$server_id}{database},u=$servers{1}{username},p=$servers{$server_id}{password} "
-		  . " --conflict-column @$table[1] --ignore-columns @$table[1] $syncCommandAdditionalAttributes";
+		  . "h=$servers{1}{host},D=$servers{1}{database},t=@$table[0],u=$servers{1}{username} "
+		  . "h=$servers{$server_id}{host},D=$servers{$server_id}{database},u=$servers{$server_id}{username} "
+		  . " --conflict-column @$table[1] --ignore-columns @$table[1] --ask-pass $syncCommandAdditionalAttributes";
 		
 		if ( $runIdentifier eq 'firstretry' or  $runIdentifier eq 'secondretry' ) {
 			print "retry ";
@@ -804,76 +805,84 @@ sub syncServer {
 		#the output contains the count of INSERT / UPDATES and the complete SQL statement
 		#we run throw all the output lines and see if we find an UPDATE, if yes we have to check if this item was also changed on an other serve
 		local *CATCHERR = IO::File->new_tmpfile;
-		my $pid = open3( gensym, \*CATCHOUT, ">&CATCHERR", $command );
+		my $pid = open3( *CMD_IN, \*CATCHOUT, ">&CATCHERR", $command );
+		
+		#send the passwords via STDIN to the pt-table-sync command
+		print CMD_IN $servers{1}{password}."\n";
+		print CMD_IN $servers{$server_id}{password} . "\n";
+		close(CMD_IN);
+
 		while (<CATCHOUT>) {
-
-			$verboseOutput = $verboseOutput . "$_";
-
-			#count the inserts and updatess
-			if ( $_ =~ /(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/ ) {			
-
-				if ( $1 > 0 or $2 > 0 ) {
-					$errorString =
-					   "There should not be any REPLACE or DELETE statements whily syncing. "
-					  . "Please make sure the databasese are 100% identical before the first sync. \n"
-					  . "See also the last SQL statement in the verbose information file \n";
-					errorMessage( 'critical', $errorString );
-				}
-			}
-
-			#found a UPDATE statment!
-			my $sql_statement = $_;
-			my $first_server_id = 1;
-			if ($sql_statement =~ /\/\*(.*)\*\/ UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\;/ ) 
-			{
-				
-				$updateCount = $updateCount + 1;
-				#before the UPDATE statement the pt-sync-table tools shows us the server that was updated this is $1
-				my $host_to_change = $1;
-				my $record_id = $3;
-				
-				wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
-			
-				#in the first round of syncing we have to check for conflicts. But we don't need the conflict checks in the second
-				#round of syncing, because all conflict information should be there after the first round.
-				if ($runIdentifier eq "first" or $runIdentifier eq "firstretry")
-				{
-					
-					#we just need to check for conflicts if the server we just updated was a master server
-					#slaves will be overwritten anyway
-					$server_to_check_for_conflicts_id = grep { $servers{$_}{host} eq $host_to_change } keys %servers;
-					
-					if ( $servers{$server_to_check_for_conflicts_id}{type} eq 'master' ) {
-						#TODO we could use $server_to_check_for_conflicts_id and replace $host_to_change here
-						checkForConflicts( $host_to_change, $record_id, @$table[0], $server_id );
+			if ($_ !~ /Enter password for.*/) {
+				$verboseOutput = $verboseOutput . "$_";
+	
+				#count the inserts and updatess
+				if ( $_ =~ /(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/ ) {			
+	
+					if ( $1 > 0 or $2 > 0 ) {
+						$errorString =
+						   "There should not be any REPLACE or DELETE statements whily syncing. "
+						  . "Please make sure the databasese are 100% identical before the first sync. \n"
+						  . "See also the last SQL statement in the verbose information file \n";
+						errorMessage( 'critical', $errorString );
 					}
 				}
 				
-			} 
-			#this case hapends for the one way syncs
-			elsif ($sql_statement =~ /UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
-				$updateCount = $updateCount + 1;
-				my $host_to_change = $7;	
-				my $record_id = $2;			
-				wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
+	
+				#found a UPDATE statment!
+				my $sql_statement = $_;
+				my $first_server_id = 1;
+				if ($sql_statement =~ /\/\*(.*)\*\/ UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\;/ ) 
+				{
+					
+					$updateCount = $updateCount + 1;
+					#before the UPDATE statement the pt-sync-table tools shows us the server that was updated this is $1
+					my $host_to_change = $1;
+					my $record_id = $3;
+					
+					wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
 				
-			} 
-			elsif ($sql_statement =~ /\/\*(.*)\*\/ INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\;/) {
-
-				$insertCount = $insertCount + 1;
-				
-				#before the INSERT statement the pt-sync-table tools shows us the server that was updated this is $1
-				my $host_to_change = $1;	
-				my $record_id = $3;			
-				wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
-			} 
-			elsif ($sql_statement =~ /INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
-
-				$insertCount = $insertCount + 1;
-
-				my $host_to_change = $7;	
-				my $record_id = $2;			
-				wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
+					#in the first round of syncing we have to check for conflicts. But we don't need the conflict checks in the second
+					#round of syncing, because all conflict information should be there after the first round.
+					if ($runIdentifier eq "first" or $runIdentifier eq "firstretry")
+					{
+						
+						#we just need to check for conflicts if the server we just updated was a master server
+						#slaves will be overwritten anyway
+						$server_to_check_for_conflicts_id = grep { $servers{$_}{host} eq $host_to_change } keys %servers;
+						
+						if ( $servers{$server_to_check_for_conflicts_id}{type} eq 'master' ) {
+							#TODO we could use $server_to_check_for_conflicts_id and replace $host_to_change here
+							checkForConflicts( $host_to_change, $record_id, @$table[0], $server_id );
+						}
+					}
+					
+				} 
+				#this case hapends for the one way syncs
+				elsif ($sql_statement =~ /UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
+					$updateCount = $updateCount + 1;
+					my $host_to_change = $7;	
+					my $record_id = $2;			
+					wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
+					
+				} 
+				elsif ($sql_statement =~ /\/\*(.*)\*\/ INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\;/) {
+	
+					$insertCount = $insertCount + 1;
+					
+					#before the INSERT statement the pt-sync-table tools shows us the server that was updated this is $1
+					my $host_to_change = $1;	
+					my $record_id = $3;			
+					wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
+				} 
+				elsif ($sql_statement =~ /INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
+	
+					$insertCount = $insertCount + 1;
+	
+					my $host_to_change = $7;	
+					my $record_id = $2;			
+					wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
+				}
 			}
 		}
 
@@ -935,7 +944,7 @@ sub syncServer {
 		}
 	
 		local *CATCHERR = IO::File->new_tmpfile;
-		my $pid = open3( gensym, \*CATCHOUT, ">&CATCHERR", $command );
+		my $pid = open3( *CMD_IN, \*CATCHOUT, ">&CATCHERR", $command );
 	
 		waitpid( $pid, 0 );
 		seek CATCHERR, 0, 0;
