@@ -2,7 +2,7 @@
 
 #Autor: Artur Neumann INF/N ict.projects@nepal.inf.org
 #Version: see $version variable
-#last change: 2013.07.30
+#last change: 2013.11.27
 #This script is written to syncronize the INF personnel database on different server
 #Its written arround pt-table-sync: http://www.percona.com/doc/percona-toolkit
 #and unison: http://www.cis.upenn.edu/~bcpierce/unison/
@@ -27,6 +27,7 @@ use POSIX qw/strftime/;
 use POSIX qw/tmpnam/;
 
 use MIME::Lite;    # to intall on ubuntu run 'sudo apt-get install libmime-lite-perl'
+use Symbol qw(gensym);
 use IO::File;
 use Storable qw(dclone);
 
@@ -35,7 +36,7 @@ use MIME::Base64;
 
 #Variables to configure
 #------------------------------------------------------
-my $version = "2.3.3";
+my $version = "2.4";
 my $ptTableSync = "/usr/bin/pt-table-sync";    #install from http://www.percona.com/doc/percona-toolkit/2.1/installation.html
 my $syncCommandAdditionalAttributes = " --print --execute --conflict-comparison newest --verbose --conflict-error die --function MD5";
 my $emailFromAddress                = 'yourmail@company.org';
@@ -92,7 +93,7 @@ my %servers = (
                    password => "db-syncpasword",
 	           type     => "master",                   #can be "master" OR "slave"
 	           pathOfFilesToSync => "/var/www/fileUploads/"    #absolute path of the files that have to be synced.
-        },       
+        },  
 
 );
 
@@ -138,9 +139,7 @@ my $server_id;
 my $emailSubjectPostfix = "";
 
 #This are MySQL and percona table sync error that just lead to a warning and a retry, all other errors will cause a abbort
-#The Table does not exist error is also just a warning error because $warning_errors is checked while syncing, 
-#we have checked the DB structure before, so if this error occures during the sync there were connection problems
-my $warning_errors = ".*?((Lost connection to MySQL server)|(Can\'t connect to MySQL server)|(MySQL server has gone away)|(Issuing rollback)|(Attribute \(innodb_version\) does not pass the type constraint because: Validation failed for \'Str\' with value undef)|(Table .*\..* does not exist on)).*?";
+my $warning_errors = ".*?((Lost connection to MySQL server)|(Can\'t connect to MySQL server)|(MySQL server has gone away)|(Issuing rollback)).*?";
 
 
 my $sql;
@@ -177,7 +176,9 @@ if ( !-e $ptTableSync ) {
 foreach $server_id (sort (keys %servers)) {
 
 	print "Connecting ... host: $servers{$server_id}{host}  database:$servers{$server_id}{database}  \n";
-	my $db = connectToMySQLServer ($server_id);
+	my $db = DBI->connect( 'DBI:mysql:' . $servers{$server_id}{database} . ';host=' . $servers{$server_id}{host}.';mysql_connect_timeout=5;mysql_read_timeout=1',
+					$servers{$server_id}{username},
+					$servers{$server_id}{password} );
 			
 	$dbh{$server_id}=$db;	
 	
@@ -243,21 +244,21 @@ foreach $server_id (sort (keys %servers)) {
 			}
 		}
 	}
-
-	print "run preexecution command on server " . $servers{$server_id}{host} . "\n";
-	$dbh{$server_id}->do( $preExecutionSQLcommand, undef, $server_id );
-
-	if ( defined $DBI::errstr ) {
-		errorMessage( 'warning', " could not run preexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n We will not sync this server and proceed with the next one (if any)\n\n" );
-		$servers{$server_id}{type} = "delete";
-	}
 }
+
+#run preexecution command on the hub
+print "run preexecution command on server " . $servers{1}{host} . "\n";
+$dbh{1}->do( $preExecutionSQLcommand, undef, 1 );
+
+if ( defined $DBI::errstr ) {
+	errorMessage( 'critical', " could not run preexecution command on " . $servers{1}{host} . "\n$DBI::errstr\n" );
+}
+
 
 #delete Servers with type==delete
 deleteMarkedServers();
 
 my $command;
-my $change_log;
 my $count_master_servers = 0;
 my $unisonLogFileFh;
 
@@ -329,11 +330,12 @@ $count_master_servers = scalar (grep { $servers{$_}{type} eq 'master' } (keys %s
 #but also if there are just two masters and there are slaves between servers[0] and the second master
 #these slaves have to be sync again to get the data from the second master
 #there is also no need to sync again in there were no changes made at all
-if ( $count_master_servers > 2 && ($insertCount > 0 || $updateCount > 0) ) {
+if (( $count_master_servers > 2 || ( $count_master_servers == 2 && $servers{2}{type} ne "master" )) 
+	  && ($insertCount > 0 || $updateCount > 0) ) {
 
 	%servers_to_retry=();
 	
-	#sync every server again to distribute the changes from the later servers to the earlier ones
+	#sync every server (exept the last one) again to distribute the changes from the later servers to the earlier ones
 	foreach $server_id (sort (keys %servers)) {
 		if ( $server_id != 1 ) {
 			syncServer( "second", $server_id );
@@ -386,27 +388,6 @@ if ( $count_master_servers > 2 && ($insertCount > 0 || $updateCount > 0) ) {
 			}			
 		}
 	}	
-}
-
-#running the postexecution command on every server
-foreach $server_id (sort (keys %servers)) {
-
-	print "run postexecution command on server " . $servers{$server_id}{host} . "\n";
-	my $db = connectToMySQLServer ($server_id);
-	
-	if (!$db) {
-			errorMessage( 'warning', "could not run postexecution command on " . $servers{$server_id}{host} . "\n" );
-	} else {
-	
-		$db->do( $postExecutionSQLcommand, undef, $server_id );
-	
-		if ( defined $DBI::errstr ) {
-			errorMessage( 'warning', "could not run postexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n" );
-	
-		}
-	
-	$db->disconnect;
-	}
 }
 
 #sending emails to loosers and winners
@@ -497,13 +478,16 @@ sub deleteMarkedServers {
 sub checkForConflicts {
 
 	
-	my $host_to_change = $_[0];
-	my $record_id      = $_[1];
-	my $table_name     = $_[2];
-	my $server_id      = $_[3];
+	my $server_to_change->{'host'}	= $_[0];
+	my $record_id     = $_[1];
+	my $table_name    = $_[2];
+	my $just_synced_server_id     = $_[3];
 	my $server_id_with_most_recent_change;
-	my $server_to_check_for_conflicts_id;
-	my $time_of_oldest_log->{'this_time'} = '000-00-00';
+	my $server_id_to_check_for_conflict;
+	my $time_of_oldest_log->{'this_time'} = '0000-00-00';
+	my $change_log;
+	my $sync_log;
+	my $changelog_sql;
 
 	my $print_string= "Check for conflicts. record_id=$record_id Table: $table_name\n";
 	print $print_string;
@@ -513,254 +497,329 @@ sub checkForConflicts {
 	#so the other one is the one with the most recent changes
 	#As we always sync from $server[0], the server with the most recent data must be either $server[0] or
 	#the one we are syncing just now.
-	if ( $host_to_change eq $servers{1}{host} ) {
-		$server_id_with_most_recent_change = $server_id;
+	if ( $server_to_change->{'host'} eq $servers{1}{host} ) {
+		$server_id_with_most_recent_change = $just_synced_server_id;
 	}
 	else {
 		$server_id_with_most_recent_change = 1;
 	}
 
-	#check if there is a conflict with this table and record_id
-	#if yes we will have to see who is the real winner and we don't need to check the other servers for
-	#conflicts because we have done this already
-	my $conflicts_exists = 0;
-	foreach my $conflict (@conflicts) {
-		if (    $conflict->{'table'} eq $table_name
-			 && $conflict->{'record_id'} eq $record_id)
-		{
-			$conflicts_exists = 1;
-
-			#if the actual server we are sycing with $server[0] is the winner, we have a new winner
-			#and we need to update the conflicts array
-			if ( $server_id_with_most_recent_change == $server_id ) {
-
-				#the former winner is now also a looser
-				push( @{ $conflict->{'loosing_parties'} }, dclone $conflict->{'winning_party'} );
-
-				#find the new winner in the looser list, make it a winner and delete it from the looser list
-				for ( my $i = 0 ; $i < @{ $conflict->{'loosing_parties'} } ; $i++ ) {
-					if ( $conflict->{'loosing_parties'}[$i]{'server'}{'id'} eq $server_id_with_most_recent_change ) {
-						$conflict->{'winning_party'} = dclone $conflict->{'loosing_parties'}[$i];
-						splice( $conflict->{'loosing_parties'}, $i, 1 );
-						last;
-					}
-				}
-			}
+	#TODO can we combine that with the IF statement before?
+	foreach my $server_id_loop (sort (keys %servers)) {
+		if ( $server_to_change->{'host'} eq $servers{$server_id_loop}{host} ) {
+			$server_to_change->{'id'} = $server_id_loop;
+			print "found server_to_change ID " . $server_to_change->{'id'}  . "\n";
 			last;
 		}
+
 	}
 
 	my %conflict;
 
-	#No need to check the other servers if we have the conflict already in our list
-	if ( $conflicts_exists == 0 ) {
+	#first check the updated host if there were any conflicts after the last sync
+	#a conflict is when there was an update on the same record since the last sync
 
-		#check for conflicts on all hosts exept the one with the most recent change
-		#a conflict is when there were an update on the same record since the last sync
-		#print "Checking for conflicts on other servers\n";
-		foreach $server_to_check_for_conflicts_id (sort (keys %servers)) {
+	#we just need to check master-servers, because slaves will be overwritten anyway
+	if ($servers{$server_to_change->{'id'}}{type} eq "master" )
+	{				
 		
-			#print "server_id_with_most_recent_change ".$server_id_with_most_recent_change . "\n";
-			#print "server_to_check_for_conflicts_id " . $server_to_check_for_conflicts_id ."\n";
+		#The UNION in the Subquery makes sure  there is a date even if the server was never synced before
+		$changelog_sql = 
+				   "SELECT  `change_log`.`timestamp` ,
+							`change_log`.comment,
+							`users`.`email`,
+							`users`.`name`,
+							`users`.`lastname`,
+							`users`.`user_name`
+					FROM `change_log`
+					JOIN `users` ON `change_log`.`user_id` = `users`.`id`
+					WHERE `table` = '$table_name'
+							AND `record_id` = '$record_id'
+							AND `change_log`.`timestamp` > 
+								(
+								SELECT this_time FROM `sync` WHERE sync_from = ? 
+								UNION SELECT '0000-00-00' 
+								ORDER BY this_time DESC LIMIT 1
+								)
+							
+					ORDER BY `change_log`.`timestamp` DESC
+					LIMIT 1";
 
-			#we just need to check master-servers, because slaves will be overwritten anyway
-			#and the server that has the most recent change don't need to be checked
-			if (    $server_to_check_for_conflicts_id != $server_id_with_most_recent_change
-				 && $servers{$server_to_check_for_conflicts_id}{type} eq "master" )
-			{
+		my %loosing_party;
 
-				#TODO erklären was hier passiert
-				#The UNION in the Subquery makes sure  there is a date even if the server was never synced before
-				$sql = "SELECT  `change_log`.`timestamp` ,
-									`change_log`.comment,
-									`users`.`email`,
-									`users`.`name`,
-									`users`.`lastname`,
-									`users`.`user_name`
-							FROM `change_log`
-							JOIN `users` ON `change_log`.`user_id` = `users`.`id`
-							WHERE `table` = '$table_name'
-									AND `record_id` = '$record_id'
-									AND `change_log`.`timestamp` > 
-										(
-										SELECT this_time FROM `sync` WHERE sync_from = ? 
-										UNION SELECT '0000-00-00' 
-										ORDER BY this_time DESC LIMIT 1
-										)
-							ORDER BY `change_log`.`timestamp` DESC
-							LIMIT 1";
-
-				my %loosing_party;
-
-				#see if we have a entry in the change_log
-				
-				$print_string= "Get changelog from ".$servers{$server_to_check_for_conflicts_id}{host} . "\n";
-				print $print_string;
-				$verboseOutput = $verboseOutput . "\n". $print_string;
-				
-								
-				my $db = connectToMySQLServer ($server_to_check_for_conflicts_id);
-				
-				if (!$db) {
-					errorMessage( 'warning', "could not check for conflicts on " . $servers{$server_to_check_for_conflicts_id}{host} . "\n" );
-					
-				} else {
-					$change_log = $db->selectrow_hashref( $sql, undef, $server_id_with_most_recent_change );
-					if ( defined $DBI::errstr ) {
-						if ($DBI::errstr =~ $warning_errors ) {
-							errorMessage( 'warning', "could not check for conflicts on " . $servers{$server_to_check_for_conflicts_id}{host} . "\n$DBI::errstr\n" );
-	
-						}
-						#anything else will lead to an abbort
-						else {
-						   errorMessage( 'critical', "could not check for conflicts on " . $servers{$server_to_check_for_conflicts_id}{host} . "\n$DBI::errstr\n" );
-	
-						}
-					}
-					
-					$db->disconnect;
-					}
-				
-				if ( defined $change_log ) {
-
-					print $change_log->{'timestamp'} . "\n";
-					 
-					#now we discovered a real conflict (the same row in the same table is changed on least two servers between
-					#the last sync and now)
-
-					#we found a loosing party
-					#for cheking who is winner and who is looser we trust pt-table-sync and NOT the timestamps in the
-					#change_log table
-					#pt-table-sync tould us already that it updated one of the servers, so we know for sure this one
-					#is a looser.
-					#if there are more than two servers in the system, and there is a conflict between 3 or more servers
-					#we first call the server we didn't sync yet also a looser, it might become the real winner when we
-					#sync it. But we want to know it from pt-table-sync
-
-					if ( not defined $change_log->{'name'} ) {
-						$change_log->{'name'} = '';
-					}
-					if ( not defined $change_log->{'lastname'} ) {
-						$change_log->{'lastname'} = '';
-					}
-					$loosing_party{'comment'}             = $change_log->{'comment'};
-					$loosing_party{'person'}{'email'}     = $change_log->{'email'};
-					$loosing_party{'person'}{'full_name'} = $change_log->{'name'} . " " . $change_log->{'lastname'};
-					$loosing_party{'person'}{'user_name'} = $change_log->{'user_name'};
-					$loosing_party{'timestamp'}           = $change_log->{'timestamp'};
-					$loosing_party{'server'}{'host'}      = $servers{$server_to_check_for_conflicts_id}{'host'};
-					$loosing_party{'server'}{'id'}        = $server_to_check_for_conflicts_id;
-					push( @{ $conflict{'loosing_parties'} }, {%loosing_party} );
+		#see if we have a entry in the change_log
+		
+						
+		my $db = connectToMySQLServer ($server_to_change->{'id'});
+		
+		if (!$db) {
+			errorMessage( 'warning', "could not check for conflicts on " . $server_to_change->{'host'} . "\n" );
+			
+		} else {
+			$change_log = $db->selectrow_hashref( $changelog_sql, undef, $server_id_with_most_recent_change );
+			if ( defined $DBI::errstr ) {
+				if ($DBI::errstr =~ $warning_errors ) {
+					errorMessage( 'warning', "could not check for conflicts on " . $server_to_change->{'host'} . "\n$DBI::errstr\n" );
 
 				}
+				#anything else will lead to an abbort
+				else {
+				   errorMessage( 'critical', "could not check for conflicts on " . $server_to_change->{'host'} . "\n$DBI::errstr\n" );
 
+				}
 			}
-		}
-
-		#if we had at least one conflict, we need to collect some more data about it
-		if ( defined $conflict{'loosing_parties'} && @{ $conflict{'loosing_parties'} } ) {
-
-			#collect the data of the conflict
-			$conflict{'table'}     = $table_name;
-			$conflict{'record_id'} = $record_id;
-
-			$sql = "SELECT this_time FROM `sync` WHERE";
-			foreach ( @{ $conflict{'loosing_parties'} } ) {
-				$sql = $sql . " sync_from = $_->{'server'}{'id'} OR ";
-			}
-
-			$sql = substr( $sql, 0, length($sql) - 3 );
-			$sql = $sql . " ORDER BY this_time ASC LIMIT 1";
-
-			print "Get get time of the oldest log: $servers{$server_id_with_most_recent_change}{host}\n";
 			
-			my $db = connectToMySQLServer ($server_id_with_most_recent_change);
-			if (!$db) {
-				errorMessage( 'warning', "could not get conflict member information from: " . $servers{$server_id_with_most_recent_change}{host} . "\n" );
-				
+			$db->disconnect;
+		}
+		
+		if ( defined $change_log ) {
+
+			print "Found Conflict (changelog) ".$change_log->{'timestamp'} . "\n";
+			 
+			#now we discovered a real conflict (the same row in the same table is changed on least two servers between
+			#the last sync and now)
+
+			#we found a loosing party
+			#for cheking who is winner and who is looser we trust pt-table-sync and NOT the timestamps in the
+			#change_log table
+			#pt-table-sync tould us already that it updated one of the servers, so we know for sure this one
+			#is a looser.
+			if ( not defined $change_log->{'name'} ) {
+				$change_log->{'name'} = '';
 			}
-			else {
-				$time_of_oldest_log = $db->selectrow_hashref($sql);
+			if ( not defined $change_log->{'lastname'} ) {
+				$change_log->{'lastname'} = '';
+			}
+			$loosing_party{'comment'}             = $change_log->{'comment'};
+			$loosing_party{'person'}{'email'}     = $change_log->{'email'};
+			$loosing_party{'person'}{'full_name'} = $change_log->{'name'} . " " . $change_log->{'lastname'};
+			$loosing_party{'person'}{'user_name'} = $change_log->{'user_name'};
+			$loosing_party{'timestamp'}           = $change_log->{'timestamp'};
+			$loosing_party{'server'}{'host'}      = $server_to_change->{'host'};
+			$loosing_party{'server'}{'id'}        = $server_to_change->{'id'};
+			push( @{ $conflict{'loosing_parties'} }, {%loosing_party} );
+			
+			
+			#get the data of the winning party
+			my $db = connectToMySQLServer ($server_id_with_most_recent_change);
+		
+			if (!$db) {
+				errorMessage( 'warning', "could not get winning party informations from " . $servers{$server_id_with_most_recent_change}{host} . "\n" );
+				
+			} else {
+				$change_log = $db->selectrow_hashref( $changelog_sql, undef, $server_to_change->{'id'} );
 				if ( defined $DBI::errstr ) {
-					errorMessage( 'warning', "could not get conflict member information from: " . $servers{$server_id_with_most_recent_change}{host} . "\n$DBI::errstr\n" );
-				} else {
-	
-					if ( not defined $time_of_oldest_log ) {    #if there were no sync before use 0000-00-00 as time
-						$time_of_oldest_log->{'this_time'} = '000-00-00';
+					if ($DBI::errstr =~ $warning_errors ) {
+						errorMessage( 'warning', "could not get winning party informations from " . $servers{$server_id_with_most_recent_change}{host} . "\n" );
+
 					}
-		
-					#get the data of the winner
-					$sql = "SELECT  `change_log`.`timestamp` ,
-											`change_log`.comment,
-											`users`.`email`,
-											`users`.`name`,
-											`users`.`lastname`,
-											`users`.`user_name`
-									FROM `change_log`
-									JOIN `users` ON `change_log`.`user_id` = `users`.`id`
-									WHERE `table` = '$table_name'
-											AND `record_id` = '$record_id'
-											AND `change_log`.`timestamp` > '$time_of_oldest_log->{'this_time'}'
-									ORDER BY `change_log`.`timestamp` DESC
-									LIMIT 1";
-		
-					print "Get more information about the conflict from: " . $servers{$server_id_with_most_recent_change}{host} . "\n";
-					$change_log = $db->selectrow_hashref($sql);
-		
-					if ( defined $DBI::errstr ) {
-						errorMessage( 'warning', "could not get conflict member information from: " . $servers{$server_id_with_most_recent_change}{host} . "\n$DBI::errstr\n" );
+					#anything else will lead to an abbort
+					else {
+					   errorMessage( 'critical', "could not get winning party informations from " . $servers{$server_id_with_most_recent_change}{host} . "\n$DBI::errstr\n" );
+
 					}
 				}
 				
 				$db->disconnect;
 			}
-			#The information aber the conflict party could not be found on this server 
-			#probably the conflict was caused by an other server and the server that just send the changes was synced but
-			#the one just received the changes was not online at that time to be checked for conflicts
-			if (!defined $change_log->{'user_name'}) {
-
-				errorMessage( 'warning', "could not find information about the winning party on: " . $servers{$server_id_with_most_recent_change}{host} . "\nProbably there was a network problem during the last sync\ntry to get information about winning party from sync_log\n" );
-								
-				$sql = "SELECT  `sync_log`.`comment`,
-								`sync_log`.`site_id_from`
-								FROM `sync_log`
-								
-								WHERE `table` = '$table_name'
-										AND `record_id` = '$record_id'
-										AND `timestamp` > '$time_of_oldest_log->{'this_time'}'
-										AND `user_id` IS NOT NULL
-										AND `site_id_to` = '1'
-								ORDER BY `timestamp` DESC
-								LIMIT 1";				
-				
-				#TODO sollen wir hier auch zu $db ändern?
-				my $sync_log = $dbh{1}->selectrow_hashref($sql);
-
-				#print "\n". $sql . "\n" . $sync_log->{'comment'} . "\n\n";
-				$change_log = eval $sync_log->{'comment'};
-				$change_log = $change_log->{'user_info'};
-				
-				$conflict{'winning_party'}{'server'}{'id'}        = $sync_log->{'site_id_from'};
-				$conflict{'winning_party'}{'server'}{'host'}      = $servers{$sync_log->{'site_id_from'}}{'host'};
-						
-				
-				
-			} else {
-				$conflict{'winning_party'}{'server'}{'host'}      = $servers{$server_id_with_most_recent_change}{'host'};
-				$conflict{'winning_party'}{'server'}{'id'}        = $server_id_with_most_recent_change;				
+			
+			#If that is not set then we cannot find the winning party yet, will will find it later by checking the synclog
+			if ( defined $change_log ) {
+				$conflict{'winning_party'}{'comment'}             = $change_log->{'comment'};
+				$conflict{'winning_party'}{'person'}{'email'}     = $change_log->{'email'};
+				$conflict{'winning_party'}{'person'}{'full_name'} = $change_log->{'name'} . " " . $change_log->{'lastname'};
+				$conflict{'winning_party'}{'person'}{'user_name'} = $change_log->{'user_name'};
+				$conflict{'winning_party'}{'timestamp'}           = $change_log->{'timestamp'};
+				$conflict{'winning_party'}{'server'}{'host'}      = $servers{$server_id_with_most_recent_change}{host};
+				$conflict{'winning_party'}{'server'}{'id'}        = $server_id_with_most_recent_change;
 			}
-
-			$conflict{'winning_party'}{'comment'}             = $change_log->{'comment'};
-			$conflict{'winning_party'}{'person'}{'email'}     = $change_log->{'email'};
-			$conflict{'winning_party'}{'timestamp'}           = $change_log->{'timestamp'};
-			$conflict{'winning_party'}{'person'}{'full_name'} = $change_log->{'name'} . " " . $change_log->{'lastname'};
-			$conflict{'winning_party'}{'person'}{'user_name'} = $change_log->{'user_name'};
-
-
-			push @conflicts, {%conflict};
-
 		}
 	}
+
+	#check for conflicts in the past sync log
+
+	#print "Checking for conflicts on other servers\n";
+	foreach $server_id_to_check_for_conflict (sort (keys %servers)) {
+	
+		#we just need to check master-servers, because slaves will be overwritten anyway
+		#and the server that has the most recent change don't need to be checked
+		if (    $server_id_to_check_for_conflict != $server_id_with_most_recent_change
+			 && $server_id_to_check_for_conflict != $server_to_change->{'id'}
+			 && $servers{$server_id_to_check_for_conflict}{type} eq "master" )
+		{
+			
+			print "checking for conflicts sync_log : " . $server_id_to_check_for_conflict  . "\n";
+			print " server_id_with_most_recent_change " . $server_id_with_most_recent_change . "\n";
+			print " server_to_change->{'id'} " . $server_to_change->{'id'} . "\n";
+			
+			#The UNION in the Subquery makes sure  there is a date even if the server was never synced before
+			$sql = "SELECT  `comment`,
+							`timestamp`,
+							`user_name`,
+							`user_email`,
+							`user_firstname`,
+							`user_lastname`,
+							`time_of_change_on_remote_server`
+						FROM `sync_log`
+
+						WHERE `table` = ?
+								AND `record_id` = ?
+								AND `site_id_from` = ?
+								AND `site_id_to` = 1
+								AND `time_of_change_on_remote_server` > 
+									(
+									SELECT this_time FROM `sync` WHERE sync_from = ? 
+									AND sync_to = ?
+									UNION SELECT '0000-00-00' 
+									ORDER BY this_time DESC LIMIT 1
+									)
+						ORDER BY `timestamp` DESC
+						LIMIT 1";
+
+			my %loosing_party;
+
+			#print $sql ."\n";
+			#print $table_name . " " .
+			#										$record_id. " " .
+			#										$server_id_to_check_for_conflict . " " .
+			#										
+			#										$server_id_with_most_recent_change. " " . 
+			#										$server_id_to_check_for_conflict . "\n";
+			#
+			$sync_log = $dbh{1}->selectrow_hashref( $sql, undef, 
+													$table_name,
+													$record_id,
+													$server_id_to_check_for_conflict , 
+													$just_synced_server_id, 
+													$server_id_to_check_for_conflict);
+			if ( defined $DBI::errstr ) {
+			   errorMessage( 'critical', "could not check for conflicts for " . $servers{$server_id_to_check_for_conflict}{host} . "\n$DBI::errstr\n" );
+			}
+			
+		
+			if ( defined $sync_log ) {
+				
+				print "Found Conflict (synclog) ".$sync_log->{'timestamp'} . "\n";
+				
+				
+				if ( not defined $sync_log->{'name'} ) {
+					$sync_log->{'name'} = '';
+				}
+				if ( not defined $sync_log->{'lastname'} ) {
+					$sync_log->{'lastname'} = '';
+				}
+
+				
+				#if we overwrite the HUB, the server we just checked must be a looser otherwise the winner
+				if ($server_to_change->{'id'} == 1) {
+					$loosing_party{'comment'}             = $sync_log->{'comment'};
+					$loosing_party{'person'}{'email'}     = $sync_log->{'user_email'};
+					$loosing_party{'person'}{'full_name'} = $sync_log->{'user_firstname'} . " " . $sync_log->{'user_lastname'};
+					$loosing_party{'person'}{'user_name'} = $sync_log->{'user_name'};
+					$loosing_party{'timestamp'}           = $sync_log->{'time_of_change_on_remote_server'};
+					$loosing_party{'server'}{'host'}      = $servers{$server_id_to_check_for_conflict}{host};
+					$loosing_party{'server'}{'id'}        = $server_id_to_check_for_conflict;
+					push( @{ $conflict{'loosing_parties'} }, {%loosing_party} );
+					
+					
+					#get the data of the winning party
+					my $db = connectToMySQLServer ($server_id_with_most_recent_change);
+				
+					if (!$db) {
+						errorMessage( 'warning', "could not get winning party informations from " . $servers{$server_id_with_most_recent_change}{host} . "\n" );
+						
+					} else {
+						$change_log = $db->selectrow_hashref( $changelog_sql, undef, $server_to_change->{'id'} );
+						if ( defined $DBI::errstr ) {
+							if ($DBI::errstr =~ $warning_errors ) {
+								errorMessage( 'warning', "could not get winning party informations from " . $servers{$server_id_with_most_recent_change}{host} . "\n" );
+		
+							}
+							#anything else will lead to an abbort
+							else {
+							   errorMessage( 'critical', "could not get winning party informations from " . $servers{$server_id_with_most_recent_change}{host} . "\n$DBI::errstr\n" );
+		
+							}
+						}
+						
+						$db->disconnect;
+					}
+					
+					$conflict{'winning_party'}{'comment'}             = $change_log->{'comment'};
+					$conflict{'winning_party'}{'person'}{'email'}     = $change_log->{'email'};
+					$conflict{'winning_party'}{'person'}{'full_name'} = $change_log->{'name'} . " " . $change_log->{'lastname'};
+					$conflict{'winning_party'}{'person'}{'user_name'} = $change_log->{'user_name'};
+					$conflict{'winning_party'}{'timestamp'}           = $change_log->{'timestamp'};
+					$conflict{'winning_party'}{'server'}{'host'}      = $servers{$server_id_with_most_recent_change}{host};
+					$conflict{'winning_party'}{'server'}{'id'}        = $server_id_with_most_recent_change;
+
+							
+					
+					
+					
+					
+
+				}
+				else {
+					$conflict{'winning_party'}{'comment'}             = $sync_log->{'comment'};
+					$conflict{'winning_party'}{'person'}{'email'}     = $sync_log->{'user_email'};
+					$conflict{'winning_party'}{'timestamp'}           = $sync_log->{'time_of_change_on_remote_server'};
+					$conflict{'winning_party'}{'person'}{'full_name'} = $sync_log->{'user_firstname'} . " " . $sync_log->{'user_lastname'};
+					$conflict{'winning_party'}{'person'}{'user_name'} = $sync_log->{'user_name'};					
+					$conflict{'winning_party'}{'server'}{'host'}      = $servers{$server_id_to_check_for_conflict}{host};
+					$conflict{'winning_party'}{'server'}{'id'}        = $server_id_to_check_for_conflict;								
+				}
+				
+			}
+		}
+	}
+	
+	#print Dumper($conflict{'loosing_parties'});
+	
+	if ( defined $conflict{'loosing_parties'} && @{ $conflict{'loosing_parties'} } ) {		
+
+		#check if there is a conflict with this table and record_id
+		#if yes we will have to see who is the real winner
+			
+		my $conflicts_exists = 0;
+		my $conflict_num = 0;
+		foreach my $conflict_loop (@conflicts) {
+			if (    $conflict_loop->{'table'} eq $table_name
+				 && $conflict_loop->{'record_id'} eq $record_id)
+			{
+				$conflicts[$conflict_num]{'winning_party'}=$conflict{'winning_party'};
+				
+				#collect all loosing parties
+				for ( my $i = 0 ; $i < @{ $conflict_loop->{'loosing_parties'} } ; $i++ ) {
+					
+					if (!grep {
+  							$_->{server}{id} == $conflict_loop->{'loosing_parties'}[$i]{server}{id}
+							} @{ $conflict{'loosing_parties'} })
+								{
+									push( @{ $conflict{'loosing_parties'} }, $conflict_loop->{'loosing_parties'}[$i] );	
+								}
+					
+					
+		  
+					}
+	
+				$conflicts[$conflict_num]{'loosing_parties'}=$conflict{'loosing_parties'};
+				$conflicts_exists=1;
+				last;
+	
+			}
+			$conflict_num++;
+		
+		}
+		
+		if ($conflicts_exists == 0) {
+			$conflict{'table'} = $table_name;
+			$conflict{'record_id'} = $record_id;
+			#print "pushing conflict to conflicts";
+			push @conflicts, {%conflict};	
+			}
+	}
+	
 }
 
 sub syncServer {
@@ -768,9 +827,37 @@ sub syncServer {
 	my $server_id = $_[1];
 	my $stopSyncingThisServer = 0; #will be set to 1 in case of a "retry" error
 	my $print_string;
-	my $server_to_check_for_conflicts_id;
+	my $server_id_to_check_for_conflict;
+
+
+#running the preexecution command on the server
+	print "run preexecution command on server " . $servers{$server_id}{host} . "\n";
+	my $db = connectToMySQLServer ($server_id);
+	
+	if (!$db) {
+		 	errorMessage( 'retry', "could not run preexecution command on " . $servers{$server_id}{host} . "\n", $server_id );
+			$stopSyncingThisServer = 1;
+	} else {
+	
+		$db->do( $postExecutionSQLcommand, undef, $server_id );
+	
+		if ( defined $DBI::errstr ) {
+			errorMessage( 'retry', "could not run preexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n", $server_id );
+			$stopSyncingThisServer = 1;
+		}
+	
+	$db->disconnect;
+	}
+
+
 
 	foreach my $table (@tableData) {
+		
+		#don't try to sync the other tables of this server or if there was a problem before don't even start
+		if ($stopSyncingThisServer == 1) {
+			last;
+		}
+		
 		$command = "$ptTableSync ";
 
 		#for the second run we don't need bidirectional syncinng as we just destributing the canges from the later sync servers.
@@ -779,9 +866,9 @@ sub syncServer {
 		}
 		$command =
 		    $command
-		  . "h=$servers{1}{host},D=$servers{1}{database},t=@$table[0],u=$servers{1}{username} "
-		  . "h=$servers{$server_id}{host},D=$servers{$server_id}{database},u=$servers{$server_id}{username} "
-		  . " --conflict-column @$table[1] --ignore-columns @$table[1] --ask-pass $syncCommandAdditionalAttributes";
+		  . "h=$servers{1}{host},D=$servers{1}{database},t=@$table[0],u=$servers{1}{username},p=$servers{1}{password} "
+		  . "h=$servers{$server_id}{host},D=$servers{$server_id}{database},u=$servers{1}{username},p=$servers{$server_id}{password} "
+		  . " --conflict-column @$table[1] --ignore-columns @$table[1] $syncCommandAdditionalAttributes";
 		
 		if ( $runIdentifier eq 'firstretry' or  $runIdentifier eq 'secondretry' ) {
 			print "retry ";
@@ -805,84 +892,78 @@ sub syncServer {
 		#the output contains the count of INSERT / UPDATES and the complete SQL statement
 		#we run throw all the output lines and see if we find an UPDATE, if yes we have to check if this item was also changed on an other serve
 		local *CATCHERR = IO::File->new_tmpfile;
-		my $pid = open3( *CMD_IN, \*CATCHOUT, ">&CATCHERR", $command );
-		
-		#send the passwords via STDIN to the pt-table-sync command
-		print CMD_IN $servers{1}{password}."\n";
-		print CMD_IN $servers{$server_id}{password} . "\n";
-		close(CMD_IN);
-
+		my $pid = open3( gensym, \*CATCHOUT, ">&CATCHERR", $command );
 		while (<CATCHOUT>) {
-			if ($_ !~ /Enter password for.*/) {
-				$verboseOutput = $verboseOutput . "$_";
-	
-				#count the inserts and updatess
-				if ( $_ =~ /(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/ ) {			
-	
-					if ( $1 > 0 or $2 > 0 ) {
-						$errorString =
-						   "There should not be any REPLACE or DELETE statements whily syncing. "
-						  . "Please make sure the databasese are 100% identical before the first sync. \n"
-						  . "See also the last SQL statement in the verbose information file \n";
-						errorMessage( 'critical', $errorString );
-					}
+
+			$verboseOutput = $verboseOutput . "$_";
+
+			#count the inserts and updatess
+			if ( $_ =~ /(\d+)\s+(\d+)\s+(\d+)\s+(\d+)/ ) {			
+
+				if ( $1 > 0 or $2 > 0 ) {
+					$errorString =
+					   "There should not be any REPLACE or DELETE statements whily syncing. "
+					  . "Please make sure the databasese are 100% identical before the first sync. \n"
+					  . "See also the last SQL statement in the verbose information file \n";
+					errorMessage( 'critical', $errorString );
 				}
+			}
+
+			#found a UPDATE statment!
+			my $sql_statement = $_;
+			my $first_server_id = 1;
+			if ($sql_statement =~ /\/\*(.*)\*\/ UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\;/ ) 
+			{
 				
-	
-				#found a UPDATE statment!
-				my $sql_statement = $_;
-				my $first_server_id = 1;
-				if ($sql_statement =~ /\/\*(.*)\*\/ UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\;/ ) 
+				$updateCount = $updateCount + 1;
+				#before the UPDATE statement the pt-sync-table tools shows us the server that was updated this is $1
+				my $server_to_change = $1;
+				my $record_id = $3;
+				
+				wrileSyncLog('UPDATE',$server_id,$server_to_change,@$table[0],$record_id,$sql_statement);
+			
+				#in the first round of syncing we have to check for conflicts. But we don't need the conflict checks in the second
+				#round of syncing, because all conflict information should be there after the first round.
+				if ($runIdentifier eq "first" or $runIdentifier eq "firstretry")
 				{
 					
-					$updateCount = $updateCount + 1;
-					#before the UPDATE statement the pt-sync-table tools shows us the server that was updated this is $1
-					my $host_to_change = $1;
-					my $record_id = $3;
-					
-					wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
-				
-					#in the first round of syncing we have to check for conflicts. But we don't need the conflict checks in the second
-					#round of syncing, because all conflict information should be there after the first round.
-					if ($runIdentifier eq "first" or $runIdentifier eq "firstretry")
-					{
-						
-						#we just need to check for conflicts if the server we just updated was a master server
-						#slaves will be overwritten anyway
-						$server_to_check_for_conflicts_id = grep { $servers{$_}{host} eq $host_to_change } keys %servers;
-						
-						if ( $servers{$server_to_check_for_conflicts_id}{type} eq 'master' ) {
-							#TODO we could use $server_to_check_for_conflicts_id and replace $host_to_change here
-							checkForConflicts( $host_to_change, $record_id, @$table[0], $server_id );
-						}
+
+					#TODO erklären was hier passiert
+					$server_id_to_check_for_conflict = grep { $servers{$_}{host} eq $server_to_change } keys %servers;
+
+					#we just need to check for conflicts if the server we just updated was a master server
+					#slaves will be overwritten anyway					
+					if ( $servers{$server_id_to_check_for_conflict}{type} eq 'master' ) {
+						#TODO we could use $server_id_to_check_for_conflict and replace $server_to_change here
+						checkForConflicts( $server_to_change, $record_id, @$table[0], $server_id );
 					}
-					
-				} 
-				#this case hapends for the one way syncs
-				elsif ($sql_statement =~ /UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
-					$updateCount = $updateCount + 1;
-					my $host_to_change = $7;	
-					my $record_id = $2;			
-					wrileSyncLog('UPDATE',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
-					
-				} 
-				elsif ($sql_statement =~ /\/\*(.*)\*\/ INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\;/) {
-	
-					$insertCount = $insertCount + 1;
-					
-					#before the INSERT statement the pt-sync-table tools shows us the server that was updated this is $1
-					my $host_to_change = $1;	
-					my $record_id = $3;			
-					wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);
-				} 
-				elsif ($sql_statement =~ /INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
-	
-					$insertCount = $insertCount + 1;
-	
-					my $host_to_change = $7;	
-					my $record_id = $2;			
-					wrileSyncLog('INSERT',$server_id,$host_to_change,@$table[0],$record_id,$sql_statement);				
 				}
+				
+			} 
+			#this case hapends for the one way syncs
+			elsif ($sql_statement =~ /UPDATE `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.*WHERE `id`=\'(\d+)\' LIMIT 1\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
+				$updateCount = $updateCount + 1;
+				my $server_to_change = $7;	
+				my $record_id = $2;			
+				wrileSyncLog('UPDATE',$server_id,$server_to_change,@$table[0],$record_id,$sql_statement);				
+				
+			} 
+			elsif ($sql_statement =~ /\/\*(.*)\*\/ INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\;/) {
+
+				$insertCount = $insertCount + 1;
+				
+				#before the INSERT statement the pt-sync-table tools shows us the server that was updated this is $1
+				my $server_to_change = $1;	
+				my $record_id = $3;			
+				wrileSyncLog('INSERT',$server_id,$server_to_change,@$table[0],$record_id,$sql_statement);
+			} 
+			elsif ($sql_statement =~ /INSERT INTO `($servers{$first_server_id}{database}|$servers{$server_id}{database})`.`@$table[0]`.* VALUES \('(\d+)',.*\)\s+\/\*percona-toolkit src_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) src_tbl:@$table[0] src_dsn:D=($servers{$first_server_id}{database}|$servers{$server_id}{database}),h=(.*),p=...,t=@$table[0],.* dst_db:($servers{$first_server_id}{database}|$servers{$server_id}{database}) dst_tbl:@$table[0] dst_dsn:D=.*,h=(.*),p=.*/) {
+
+				$insertCount = $insertCount + 1;
+
+				my $server_to_change = $7;	
+				my $record_id = $2;			
+				wrileSyncLog('INSERT',$server_id,$server_to_change,@$table[0],$record_id,$sql_statement);				
 			}
 		}
 
@@ -926,11 +1007,11 @@ sub syncServer {
 
 	}
 
-##now we are sync the files
 
-	#we don't try to sync the files if the sync was aborted during the database sync
+	#some last steps of the sync, but we don't try them if the sync was aborted during the database sync
 	if ($stopSyncingThisServer == 0) {
 
+		#sync the files
 		print "Syncing files with $servers{$server_id}{host}\n";
 	
 		$command =
@@ -944,7 +1025,7 @@ sub syncServer {
 		}
 	
 		local *CATCHERR = IO::File->new_tmpfile;
-		my $pid = open3( *CMD_IN, \*CATCHOUT, ">&CATCHERR", $command );
+		my $pid = open3( gensym, \*CATCHOUT, ">&CATCHERR", $command );
 	
 		waitpid( $pid, 0 );
 		seek CATCHERR, 0, 0;
@@ -965,23 +1046,49 @@ sub syncServer {
 				print $_;
 			}
 		}
+	
+		#run postexecution command
+		print "run postexecution command on server " . $servers{$server_id}{host} . "\n";
+		$db = connectToMySQLServer ($server_id);
+		
+		if (!$db) {
+				errorMessage( 'warning', "could not run postexecution command on " . $servers{$server_id}{host} . "\n" );
+		} else {
+		
+			$db->do( $postExecutionSQLcommand, undef, $server_id );
+		
+			if ( defined $DBI::errstr ) {
+				errorMessage( 'warning', "could not run postexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n" );
+		
+			}
+		
+		$db->disconnect;
+		}
 	}
 }
 
 sub wrileSyncLog {
-	my $write_type		= $_[0];
-	my $server_id		= $_[1];
-	my $host_to_change	= $_[2];
-	my $table			= $_[3];
-	my $record_id 		= $_[4];
-	my $sql_statement 	= $_[5];
-	my $host_id_from 	= 1;
-	my $host_id_to 		= 1;
+	my $write_type			= $_[0];
+	my $server_id			= $_[1];
+	my $server_to_change	= $_[2];
+	my $table				= $_[3];
+	my $record_id 			= $_[4];
+	my $sql_statement 		= $_[5];
+	my $host_id_from 		= 1;
+	my $host_id_to 			= 1;
 	my $change_log;
-	my $comment;
+	my $sync_log;
+	my $comment = "unknown";
+	my $user_email = "unknown";
+	my $user_name = "unknown";
+	my $user_id = "unknown";
+	my $user_firstname = "unknown";
+	my $user_lastname = "unknown";
+	my $time_of_change_on_remote_server = "NOW() - INTERVAL 60 SECOND"; #just to get something between now and the last sync
+	
 	my $print_string;
 	
-	if ($host_to_change ne $servers{$server_id}{host}) {
+	if ($server_to_change ne $servers{$server_id}{host}) {
 		$host_id_from = $server_id;
 	} else {
 		$host_id_to = $server_id;
@@ -998,14 +1105,16 @@ sub wrileSyncLog {
 						`users`.`email`,
 						`users`.`name`,
 						`users`.`lastname`,
-						`users`.`user_name`
+						`users`.`user_name`,
+						COUNT(*) AS count
 				FROM `change_log`
 				JOIN `users` ON `change_log`.`user_id` = `users`.`id`
-				WHERE `table` = '$table'
-						AND `record_id` = '$record_id'
+				WHERE `table` = ?
+						AND `record_id` = ?
 						AND `change_log`.`timestamp` > 
 							(
 							SELECT this_time FROM `sync` WHERE sync_from = ? 
+														 AND sync_to = ?
 							UNION SELECT '0000-00-00' 
 							ORDER BY this_time DESC LIMIT 1
 							)
@@ -1019,27 +1128,19 @@ sub wrileSyncLog {
 
 	
 	my $db = connectToMySQLServer ($host_id_from);
-	if (!$db) {
-		errorMessage( 'warning', "could not get the changelog from: " . $servers{$host_id_from}{host} . "\n" );
-		$change_log->{'comment'} = "unknown";
-		$change_log->{'email'} = "unknown";
-		$change_log->{'name'} = "unknown";
-		$change_log->{'lastname'} = "unknown";
-		$change_log->{'user_name'} = "unknown";		
-	}
-	else {		
+	if (!$db && $host_id_from != 1) {
+		errorMessage( 'warning', "could not get the changelog from: " . $servers{$host_id_from}{host} . "\n" );	
+	} elsif (!$db && $host_id_from == 1) {
+		#not beeing able to connect to MySQL on ther hub server is a critical error
+		errorMessage( 'critical', "could not connect to MySQL server on: " . $servers{$host_id_from}{host} . "\n$DBI::errstr\n" );
+	} else {		
 		
-		$change_log = $db->selectrow_hashref( $sql, undef, $host_id_to );
+		$change_log = $db->selectrow_hashref( $sql, undef, $table, $record_id, $host_id_to,$host_id_from );
 		if ( defined $DBI::errstr ) {
 	
 			if ($DBI::errstr =~ $warning_errors) {
 				
 				errorMessage( 'warning', "could not get the changelog from: " . $servers{$host_id_from}{host} . "\n$DBI::errstr\n" );
-				$change_log->{'comment'} = "unknown";
-				$change_log->{'email'} = "unknown";
-				$change_log->{'name'} = "unknown";
-				$change_log->{'lastname'} = "unknown";
-				$change_log->{'user_name'} = "unknown";
 	
 			}
 			#anything else will lead to an abbort
@@ -1048,24 +1149,98 @@ sub wrileSyncLog {
 	
 			}	
 		}
+		
+		$comment = $change_log->{'comment'};
+		$user_email = $change_log->{'email'};
+		$user_name = $change_log->{'user_name'};
+		$user_id = $change_log->{'id'};
+		$user_firstname = $change_log->{'name'};
+		$user_lastname = $change_log->{'lastname'};
+		$time_of_change_on_remote_server = $change_log->{'timestamp'};
+
+
 	
 	$db->disconnect;	
 	}
+	if ($change_log->{'count'}  == 0 && $host_id_from == 1) {
+		#we could not find the change in the changelog, so lets check the sync_log
 		
-	my $sql       = "INSERT INTO sync_log (`site_id_from`,`site_id_to`,`table`,`record_id`,`update_type`,`user_id`,`comment`) 
-						VALUES (?,?,?,?,?,?,?)";
+		#print "get changes from sync_log\n";
+
+		$sql = "SELECT  `timestamp`,
+						`user_name`,
+						`user_id`,
+						`user_email`,
+						`user_firstname`,
+						`user_lastname`,
+						`time_of_change_on_remote_server`,
+						`comment`
+					FROM `sync_log`
+
+					WHERE `table` = ?
+							AND `record_id` = ?
+							AND `site_id_to` = 1
+							AND `time_of_change_on_remote_server` > 
+								(
+								SELECT this_time FROM `sync` WHERE sync_from = ? 
+								AND sync_to = 1
+								UNION SELECT '0000-00-00' 
+								ORDER BY this_time DESC LIMIT 1
+								)
+					ORDER BY `timestamp` DESC
+					LIMIT 1";	
+
+		$sync_log = $dbh{1}->selectrow_hashref( $sql, undef, $table, $record_id,$host_id_from );
+
+		if ( defined $DBI::errstr ) {
+			errorMessage( 'critical', "could not get the sync_log \n$DBI::errstr\n" );
+		} else {
+			$comment = $sync_log->{'comment'};
+			$user_email = $sync_log->{'user_email'};
+			$user_name = $sync_log->{'user_name'};
+			$user_id = $sync_log->{'user_id'};
+			$user_firstname = $sync_log->{'user_firstname'};
+			$user_lastname = $sync_log->{'user_lastname'};
+			$time_of_change_on_remote_server = $sync_log->{'time_of_change_on_remote_server'};
+		}
+
+	
+	}
+	
+	my $sql       = "INSERT INTO sync_log (
+								`site_id_from`,
+								`site_id_to`,
+								`table`,
+								`record_id`,
+								`update_type`,
+								`time_of_change_on_remote_server`,
+								`user_id`,
+								`user_email`,
+								`user_firstname`,
+								`user_lastname`,
+								`user_name`,
+								`comment`,
+								`sql`) 
+						VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)";
 	
 	if ($write_type ne "UPDATE" and $write_type ne "INSERT") {
 		errorMessage( 'critical', "the write_type in the writeSyncLog function can just be UPDATE or INSERT\n" );
 	}
 	
 	
-	
-	$Data::Dumper::Indent = 0;
-	$Data::Dumper::Terse = 1;
-	#$Data::Dumper::Varname = "sync_info";
- 	$comment = Dumper({'user_info'=>$change_log,'sql'=>$sql_statement});
-	$dbh{1}->do( $sql, undef, @{[$host_id_from, $host_id_to,$table,$record_id,$write_type,$change_log->{'id'},$comment]});
+	$dbh{1}->do( $sql, undef, @{[$host_id_from, 
+								 $host_id_to,
+								 $table,
+								 $record_id,
+								 $write_type,
+								 $time_of_change_on_remote_server,
+								 $user_id,
+								 $user_email,
+								 $user_firstname,
+								 $user_lastname,
+								 $user_name,
+								 $comment,
+								 $sql_statement]});
 	if ( defined $DBI::errstr ) {
 		errorMessage( 'critical', "could not write sync_log  \n$DBI::errstr\n" );
 	}	
@@ -1078,7 +1253,7 @@ sub wrileSyncLog {
 sub stampServer {
 	my $server_id_to_stamp      = $_[0];
 	my $server_id_got_data_from = $_[1];
-	my $sql_for_sync_stamp       = "INSERT INTO sync (sync_from,this_time) VALUES (?,NOW())
+	my $sql_for_sync_stamp       = "INSERT INTO sync (sync_from,sync_to,this_time) VALUES (?,?,NOW())
  			  			  			ON DUPLICATE KEY UPDATE last_time=this_time, this_time=NOW();";
 
 	print "Stamping Server $servers{$server_id_to_stamp}{host} to be sync from $servers{$server_id_got_data_from}{host}\n";
@@ -1092,12 +1267,13 @@ sub stampServer {
 			errorMessage( 'warning', "could not stamp  " . $servers{$server_id_to_stamp}{host} . "\n" );	
 		}
 		else {	
-			$db->do( $sql_for_sync_stamp, undef, $server_id_got_data_from );
+			$db->do( $sql_for_sync_stamp, undef, $server_id_got_data_from,$server_id_to_stamp);
 			if ( defined $DBI::errstr ) {
 				errorMessage( 'warning', "could not stamp  " . $servers{$server_id_to_stamp}{host} . "\n$DBI::errstr\n" );
 			}
 			$db->disconnect;
 		}
+		$dbh{1}->do( $sql_for_sync_stamp, undef, $server_id_got_data_from,$server_id_to_stamp);
 	}
 }
 
@@ -1279,3 +1455,4 @@ sub connectToMySQLServer {
 		return $db;
 	}
 }
+
