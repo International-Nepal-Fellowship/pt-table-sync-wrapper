@@ -2,7 +2,7 @@
 
 #Autor: Artur Neumann INF/N ict.projects@nepal.inf.org
 #Version: see $version variable
-#last change: 2013.11.27
+#last change: 2013.12.2
 #This script is written to syncronize the INF personnel database on different server
 #Its written arround pt-table-sync: http://www.percona.com/doc/percona-toolkit
 #and unison: http://www.cis.upenn.edu/~bcpierce/unison/
@@ -36,7 +36,7 @@ use MIME::Base64;
 
 #Variables to configure
 #------------------------------------------------------
-my $version = "2.4";
+my $version = "2.4.1";
 my $ptTableSync = "/usr/bin/pt-table-sync";    #install from http://www.percona.com/doc/percona-toolkit/2.1/installation.html
 my $syncCommandAdditionalAttributes = " --print --execute --conflict-comparison newest --verbose --conflict-error die --function MD5";
 my $emailFromAddress                = 'yourmail@company.org';
@@ -117,6 +117,7 @@ my @tableData = (
 	[ "name",                     "name_timestamp" ]
 
 );
+
 
 #do not change anything below this line or your computer will explode, the sun will fade, the universe colaps and the world we
 #know will end. So be carefull, You have been warned!
@@ -835,14 +836,27 @@ sub syncServer {
 	my $db = connectToMySQLServer ($server_id);
 	
 	if (!$db) {
-		 	errorMessage( 'retry', "could not run preexecution command on " . $servers{$server_id}{host} . "\n", $server_id );
+
+			if ($runIdentifier eq 'firstretry' or $runIdentifier eq 'secondretry') {
+				errorMessage( 'warning', "could not run preexecution command on " . $servers{$server_id}{host} . "\nWe will not sync the server " .$servers{$server_id}{host} . " and proceed with the next one (if any)\n\n" );
+				$servers{$server_id}{type} = "delete";
+			}	else {
+				errorMessage( 'retry', "could not run preexecution command on " . $servers{$server_id}{host} . "\n", $server_id );				
+			}	
+		
 			$stopSyncingThisServer = 1;
 	} else {
 	
 		$db->do( $postExecutionSQLcommand, undef, $server_id );
 	
 		if ( defined $DBI::errstr ) {
-			errorMessage( 'retry', "could not run preexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n", $server_id );
+			if ($runIdentifier eq 'firstretry' or $runIdentifier eq 'secondretry') {
+				errorMessage( 'warning', "could not run preexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\nWe will not sync the server " .$servers{$server_id}{host} . " and proceed with the next one (if any)\n\n" );
+				$servers{$server_id}{type} = "delete";
+			}	else {
+				errorMessage( 'retry', "could not run preexecution command on " . $servers{$server_id}{host} . "\n$DBI::errstr\n", $server_id );
+			}			
+			
 			$stopSyncingThisServer = 1;
 		}
 	
@@ -980,7 +994,6 @@ sub syncServer {
 					if ($runIdentifier eq 'firstretry' or $runIdentifier eq 'secondretry') {
 						errorMessage( 'warning', $_ . "\nWe will not sync the server " .$servers{$server_id}{host} . " and proceed with the next one (if any)\n\n" );
 						$servers{$server_id}{type} = "delete";
-						$stopSyncingThisServer=1;
 					}
 					
 					#if the error comes the first time we will retry to sync the server later
